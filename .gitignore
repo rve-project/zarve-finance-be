@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+*.log
+
+# reference/import files with real customer, business, and bank data
+*.xlsx
+imports/

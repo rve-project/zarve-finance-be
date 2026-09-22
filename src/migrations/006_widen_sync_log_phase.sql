@@ -1,0 +1,1 @@
+ALTER TABLE zarve_sync_log MODIFY COLUMN phase VARCHAR(255) NULL;
