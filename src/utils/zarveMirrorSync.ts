@@ -114,6 +114,22 @@ export async function isSyncRunning(): Promise<boolean> {
   return (rows as any[]).length > 0;
 }
 
+/** Call once on process startup. A 'running' row can only mean an in-flight sync from
+ * a PREVIOUS process instance -- this process has no memory of it, and the code that
+ * would eventually mark it done/error died with that instance (e.g. a deploy restart
+ * killed it mid-sync). Left alone, isSyncRunning() would see that stale row forever
+ * and permanently block the "Sinkronkan Sekarang" button and the nightly cron. */
+export async function markOrphanedSyncsAsInterrupted(): Promise<void> {
+  const [result] = await pool.query(
+    "UPDATE zarve_sync_log SET status = 'error', error_message = 'Sinkronisasi terhenti (proses aplikasi di-restart sebelum selesai).', finished_at = ? WHERE status = 'running'",
+    [nowMysqlDateTime()]
+  );
+  const affected = (result as any).affectedRows;
+  if (affected > 0) {
+    console.log(`[sync] ${affected} sinkronisasi 'running' dari proses sebelumnya ditandai terhenti saat startup.`);
+  }
+}
+
 export async function syncZarveMirror(): Promise<ZarveMirrorSyncResult> {
   const startedAtMs = Date.now();
   const [logResult] = await pool.query("INSERT INTO zarve_sync_log (started_at, status, phase) VALUES (?, 'running', 'Memulai...')", [

@@ -51,6 +51,11 @@ export async function syncAndPost() {
 }
 
 export function startScheduler() {
-  cron.schedule(SCHEDULE, syncAndPost);
-  console.log(`[scheduler] Sinkronisasi Zarve otomatis dijadwalkan setiap hari jam 02:00 (cron: "${SCHEDULE}").`);
+  // Explicit timezone -- without it, node-cron reads "02:00" against the server's OWN
+  // system clock, which isn't WIB on every box this runs on (confirmed: the staging
+  // host's system tz is UTC+8, and the production Docker container defaults to UTC,
+  // so "02:00" was actually firing at 01:00 WIB and 09:00 WIB respectively -- the
+  // latter is smack in business hours, not the empty-night window this is meant for).
+  cron.schedule(SCHEDULE, syncAndPost, { timezone: "Asia/Jakarta" });
+  console.log(`[scheduler] Sinkronisasi Zarve otomatis dijadwalkan setiap hari jam 02:00 WIB (cron: "${SCHEDULE}").`);
 }
