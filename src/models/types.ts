@@ -121,3 +121,7 @@ export interface User {
 }
 
 export type PublicUser = Omit<User, "passwordHash">;
+
+export interface ManagedUser extends PublicUser {
+  createdAt: string;
+}

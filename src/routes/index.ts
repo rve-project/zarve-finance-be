@@ -17,6 +17,7 @@ import { reconciliationRouter } from "./reconciliation.routes";
 import { journalEntriesRouter } from "./journalEntries.routes";
 import { vendorBillsRouter } from "./vendorBills.routes";
 import { vendorPaymentsRouter } from "./vendorPayments.routes";
+import { usersRouter } from "./users.routes";
 
 export const apiRouter = Router();
 
@@ -39,3 +40,4 @@ apiRouter.use("/reconciliation", reconciliationRouter);
 apiRouter.use("/journal-entries", journalEntriesRouter);
 apiRouter.use("/vendor-bills", vendorBillsRouter);
 apiRouter.use("/vendor-payments", vendorPaymentsRouter);
+apiRouter.use("/users", usersRouter);

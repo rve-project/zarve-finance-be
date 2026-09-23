@@ -5,5 +5,6 @@ import { requireAuth } from "../middlewares/auth";
 export const authRouter = Router();
 
 authRouter.post("/login", authController.login);
+authRouter.post("/google", authController.googleLogin);
 authRouter.post("/logout", authController.logout);
 authRouter.get("/me", requireAuth, authController.me);

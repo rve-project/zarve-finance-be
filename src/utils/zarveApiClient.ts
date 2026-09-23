@@ -127,21 +127,22 @@ export interface ZarveLoginUser {
   isSuspended?: boolean;
 }
 
-// Lets rve-finance delegate its own login to Zarve's account system, so staff use one
-// set of credentials -- see auth.controller.ts. Deliberately bypasses zarveGetRaw: this
-// call carries the end user's own email/password, not the service-level ZARVE_API_TOKEN.
-// Returns null for a plain wrong-password rejection (caller reports "invalid
-// credentials"); throws ApiError(502) only when Zarve itself is unreachable/erroring,
-// so the two failure modes stay distinguishable to the end user.
-export async function zarveLogin(email: string, password: string): Promise<{ user: ZarveLoginUser; token: string } | null> {
+type ZarveLoginResult = { user: ZarveLoginUser; token: string };
+
+// Shared by both login flows below -- each carries the end user's own credentials, not
+// the service-level token, so they deliberately bypass zarveGetRaw. Returns null for a
+// plain credential rejection (caller reports "invalid credentials"); throws
+// ApiError(502) only when Zarve itself is unreachable/erroring, so the two failure
+// modes stay distinguishable to the end user.
+async function zarveAuthPost(path: string, payload: unknown, rejectStatuses: number[]): Promise<ZarveLoginResult | null> {
   if (!env.zarveApi.baseUrl) throw new ApiError(500, "ZARVE_API_URL belum diset di .env");
 
   let res: Response;
   try {
-    res = await fetch(`${env.zarveApi.baseUrl}/auth/login`, {
+    res = await fetch(`${env.zarveApi.baseUrl}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify(payload),
     });
   } catch {
     throw new ApiError(502, "Tidak bisa menghubungi Zarve API untuk login. Coba lagi sebentar.");
@@ -150,14 +151,28 @@ export async function zarveLogin(email: string, password: string): Promise<{ use
   const body = (await res.json().catch(() => null)) as {
     success?: boolean;
     message?: string;
-    data?: { user: ZarveLoginUser; token: string };
+    data?: ZarveLoginResult;
   } | null;
 
-  if (res.status === 401 || res.status === 400) return null;
+  if (rejectStatuses.includes(res.status)) return null;
   if (!res.ok || !body?.success || !body.data) {
     throw new ApiError(502, `Zarve API sedang tidak bisa diakses: ${body?.message ?? res.status}`);
   }
   return body.data;
+}
+
+// Lets rve-finance delegate its own login to Zarve's account system, so staff use one
+// set of credentials -- see auth.controller.ts.
+export function zarveLogin(email: string, password: string) {
+  return zarveAuthPost("/auth/login", { email, password }, [400, 401]);
+}
+
+// Google sign-in: rve-finance-fe runs the same Firebase (project rve-trans) popup as
+// zarve-fe, and the resulting Firebase ID token is verified by Zarve's own
+// /auth/google-admin -- rve-finance never verifies Google tokens itself.
+// 403/404 there mean "no Zarve admin account for this Google email", not an outage.
+export function zarveGoogleLogin(idToken: string) {
+  return zarveAuthPost("/auth/google-admin", { idToken }, [400, 401, 403, 404]);
 }
 
 export interface ZarveDriver {
