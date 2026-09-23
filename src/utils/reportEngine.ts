@@ -1,5 +1,5 @@
 import { pool } from "../db";
-import { Account, AccountType } from "../models/types";
+import { Account, AccountType, BusinessUnit } from "../models/types";
 
 export interface AccountBalanceRow {
   account: Account;
@@ -28,20 +28,22 @@ export async function getAccountBalances(params: {
   from: string;
   to: string;
   types?: AccountType[];
+  businessUnit: BusinessUnit;
 }): Promise<AccountBalanceRow[]> {
-  const { from, to, types } = params;
-  const clauses: string[] = [];
-  const args: unknown[] = [];
+  const { from, to, types, businessUnit } = params;
+  const clauses: string[] = ["a.business_unit = ?"];
+  const args: unknown[] = [businessUnit];
 
   if (types && types.length) {
     clauses.push(`a.type IN (${types.map(() => "?").join(",")})`);
     args.push(...types);
   }
-  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const where = `WHERE ${clauses.join(" AND ")}`;
 
   const sql = `
     SELECT
-      a.id, a.code, a.name, a.type, a.parent_id, a.is_active,
+      a.id, a.code, a.name, a.type, a.parent_id, a.is_active, a.business_unit, a.description,
+      a.category_id, a.tax_id, a.access_mode,
       COALESCE(SUM(CASE WHEN je.date < ? THEN jl.debit - jl.credit ELSE 0 END), 0) AS initial_raw,
       COALESCE(SUM(CASE WHEN je.date BETWEEN ? AND ? THEN jl.debit ELSE 0 END), 0) AS period_debit,
       COALESCE(SUM(CASE WHEN je.date BETWEEN ? AND ? THEN jl.credit ELSE 0 END), 0) AS period_credit,
@@ -50,7 +52,8 @@ export async function getAccountBalances(params: {
     LEFT JOIN journal_lines jl ON jl.account_id = a.id
     LEFT JOIN journal_entries je ON je.id = jl.journal_entry_id
     ${where}
-    GROUP BY a.id, a.code, a.name, a.type, a.parent_id, a.is_active
+    GROUP BY a.id, a.code, a.name, a.type, a.parent_id, a.is_active, a.business_unit, a.description,
+      a.category_id, a.tax_id, a.access_mode
     ORDER BY a.code
   `;
 
@@ -64,6 +67,11 @@ export async function getAccountBalances(params: {
       type: row.type,
       parentId: row.parent_id,
       isActive: !!row.is_active,
+      businessUnit: row.business_unit,
+      description: row.description,
+      categoryId: row.category_id,
+      taxId: row.tax_id,
+      accessMode: row.access_mode,
     };
     return {
       account,

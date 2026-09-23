@@ -6,3 +6,6 @@ dist
 # reference/import files with real customer, business, and bank data
 *.xlsx
 imports/
+
+# user-uploaded files (product images, transfer attachments) -- runtime data, not source
+uploads/

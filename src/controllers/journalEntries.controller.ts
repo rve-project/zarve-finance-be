@@ -18,6 +18,7 @@ function mapEntryRow(row: any) {
     narration: row.narration,
     sourceType: row.source_type,
     sourceId: row.source_id,
+    businessUnit: row.business_unit,
     createdAt: row.created_at,
   };
 }
@@ -32,6 +33,7 @@ function mapLineRow(row: any) {
     partnerName: row.partner_name,
     debit: Number(row.debit),
     credit: Number(row.credit),
+    description: row.description,
   };
 }
 
@@ -41,8 +43,8 @@ export const journalEntriesController = {
     const page = req.query.page ? Number(req.query.page) : 1;
     const limit = req.query.limit ? Number(req.query.limit) : 20;
 
-    const clauses: string[] = [];
-    const params: unknown[] = [];
+    const clauses: string[] = ["business_unit = ?"];
+    const params: unknown[] = [req.businessUnit];
     if (from) {
       clauses.push("date >= ?");
       params.push(from);
@@ -51,7 +53,7 @@ export const journalEntriesController = {
       clauses.push("date <= ?");
       params.push(to);
     }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const where = `WHERE ${clauses.join(" AND ")}`;
 
     const [countRows] = await pool.query(`SELECT COUNT(*) AS cnt FROM journal_entries ${where}`, params);
     const total = (countRows as any[])[0].cnt as number;
@@ -78,7 +80,7 @@ export const journalEntriesController = {
   async get(req: Request, res: Response) {
     const [entryRows] = await pool.query("SELECT * FROM journal_entries WHERE id = ?", [req.params.id]);
     const entry = (entryRows as any[])[0];
-    if (!entry) throw new ApiError(404, "Jurnal tidak ditemukan");
+    if (!entry || entry.business_unit !== req.businessUnit) throw new ApiError(404, "Jurnal tidak ditemukan");
 
     const [lineRows] = await pool.query(
       `SELECT jl.*, a.code AS account_code, a.name AS account_name, p.name AS partner_name
@@ -103,6 +105,7 @@ export const journalEntriesController = {
       partnerId: l.partnerId ? Number(l.partnerId) : null,
       debit: Number(l.debit) || 0,
       credit: Number(l.credit) || 0,
+      description: l.description || null,
     }));
     if (journalLines.some((l) => !l.accountId || (l.debit === 0 && l.credit === 0))) {
       throw new ApiError(400, "Setiap baris wajib punya akun dan nilai debit atau kredit");
@@ -119,7 +122,14 @@ export const journalEntriesController = {
     }
 
     // postJournalEntry itself throws if debit != credit -- no need to duplicate that check.
-    const id = await postJournalEntry({ date, ref: ref ?? null, narration: narration ?? null, sourceType: "manual", lines: journalLines });
+    const id = await postJournalEntry({
+      date,
+      ref: ref ?? null,
+      narration: narration ?? null,
+      sourceType: "manual",
+      businessUnit: req.businessUnit,
+      lines: journalLines,
+    });
     res.status(201).json({ id });
   },
 
@@ -128,7 +138,7 @@ export const journalEntriesController = {
   async reverse(req: Request, res: Response) {
     const [entryRows] = await pool.query("SELECT * FROM journal_entries WHERE id = ?", [req.params.id]);
     const entry = (entryRows as any[])[0];
-    if (!entry) throw new ApiError(404, "Jurnal tidak ditemukan");
+    if (!entry || entry.business_unit !== req.businessUnit) throw new ApiError(404, "Jurnal tidak ditemukan");
 
     const [lineRows] = await pool.query("SELECT * FROM journal_lines WHERE journal_entry_id = ?", [req.params.id]);
     const lines = lineRows as any[];
@@ -139,6 +149,7 @@ export const journalEntriesController = {
       partnerId: l.partner_id,
       debit: Number(l.credit),
       credit: Number(l.debit),
+      description: l.description,
     }));
 
     const id = await postJournalEntry({
@@ -146,6 +157,7 @@ export const journalEntriesController = {
       ref: entry.ref ? `REV-${entry.ref}` : `REV-JE${entry.id}`,
       narration: `Pembalik jurnal #${entry.id}${entry.narration ? ` (${entry.narration})` : ""}`,
       sourceType: "manual",
+      businessUnit: entry.business_unit,
       lines: reversedLines,
     });
     res.status(201).json({ id });

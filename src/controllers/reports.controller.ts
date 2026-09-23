@@ -15,7 +15,7 @@ function requireDateRange(req: Request): { from: string; to: string } {
 export const reportsController = {
   async trialBalance(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to });
+    const rows = await getAccountBalances({ from, to, businessUnit: req.businessUnit });
     res.json({ from, to, rows });
   },
 
@@ -23,6 +23,9 @@ export const reportsController = {
     const { from, to } = requireDateRange(req);
     const accountId = Number(req.query.accountId);
     if (!accountId) throw new ApiError(400, "accountId wajib diisi");
+    const [accountRows] = await pool.query("SELECT business_unit FROM accounts WHERE id = ?", [accountId]);
+    const account = (accountRows as any[])[0];
+    if (!account || account.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
     const page = req.query.page ? Number(req.query.page) : 1;
     const limit = req.query.limit ? Number(req.query.limit) : 50;
     const { lines, total, totalDebit, totalCredit, endBalance } = await getGeneralLedgerLines(accountId, from, to, page, limit);
@@ -31,7 +34,7 @@ export const reportsController = {
 
   async profitAndLoss(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, types: ["income", "expense"] });
+    const rows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit: req.businessUnit });
 
     const income = rows.filter((r) => r.account.type === "income");
     const expense = rows.filter((r) => r.account.type === "expense");
@@ -51,7 +54,7 @@ export const reportsController = {
 
   async balanceSheet(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
-    const rows = await getAccountBalances({ from: EPOCH, to: asOf });
+    const rows = await getAccountBalances({ from: EPOCH, to: asOf, businessUnit: req.businessUnit });
 
     const assets = rows.filter((r) => r.account.type === "asset");
     const liabilities = rows.filter((r) => r.account.type === "liability");
@@ -70,7 +73,15 @@ export const reportsController = {
       0
     );
     const netIncomeRow = {
-      account: { id: 0, code: "3900", name: "Laba Ditahan (Berjalan)", type: "equity" as const, parentId: null, isActive: true },
+      account: {
+        id: 0,
+        code: "3900",
+        name: "Laba Ditahan (Berjalan)",
+        type: "equity" as const,
+        parentId: null,
+        isActive: true,
+        businessUnit: req.businessUnit,
+      },
       initialBalance: 0,
       periodDebit: 0,
       periodCredit: 0,
@@ -100,7 +111,7 @@ export const reportsController = {
    */
   async cashFlow(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, types: ["asset"] });
+    const rows = await getAccountBalances({ from, to, types: ["asset"], businessUnit: req.businessUnit });
     const cashAccounts = rows.filter((r) => r.account.code.startsWith("11"));
 
     const beginningBalance = cashAccounts.reduce((sum, r) => sum + r.initialBalance, 0);
@@ -125,6 +136,11 @@ export const reportsController = {
    * invoice date (this ledger has no separate due-date field -- a rental invoice's
    * obligation starts on the invoice date itself). Standard AR-aging report, missing
    * from this system until now.
+   *
+   * Deliberately NOT business-unit-scoped: this reads `invoices`/`payments` directly,
+   * which are Zarve-only tables (see 014_business_unit.sql) -- same for
+   * vehicleProfitability and geofenceViolations below. Don't "fix" these into reading
+   * req.businessUnit; they're hidden from the nav entirely in B2B mode instead.
    */
   async agedReceivables(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);

@@ -1,7 +1,7 @@
 import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
-import { JournalSourceType } from "../models/types";
+import { BusinessUnit, JournalSourceType } from "../models/types";
 
 export interface JournalLineInput {
   accountId: number;
@@ -9,6 +9,7 @@ export interface JournalLineInput {
   debit: number;
   credit: number;
   analyticTag?: string | null;
+  description?: string | null;
 }
 
 export interface PostJournalEntryInput {
@@ -17,6 +18,11 @@ export interface PostJournalEntryInput {
   narration?: string | null;
   sourceType: JournalSourceType;
   sourceId?: number | null;
+  /** Defaults to "zarve" -- every existing caller (invoices, payments, vendor bills,
+   * vendor payments, reconciliation) posts exclusively to the Zarve business and needs
+   * no change. Only the manual Jurnal Entries screen passes this explicitly, since
+   * it's the one posting path usable by either business unit. */
+  businessUnit?: BusinessUnit;
   lines: JournalLineInput[];
 }
 
@@ -46,15 +52,15 @@ export async function postJournalEntry(
   const runner = conn ?? pool;
 
   const [result] = await runner.query(
-    "INSERT INTO journal_entries (date, ref, narration, source_type, source_id) VALUES (?, ?, ?, ?, ?)",
-    [input.date, input.ref ?? null, input.narration ?? null, input.sourceType, input.sourceId ?? null]
+    "INSERT INTO journal_entries (date, ref, narration, source_type, source_id, business_unit) VALUES (?, ?, ?, ?, ?, ?)",
+    [input.date, input.ref ?? null, input.narration ?? null, input.sourceType, input.sourceId ?? null, input.businessUnit ?? "zarve"]
   );
   const journalEntryId = (result as any).insertId;
 
   for (const line of input.lines) {
     await runner.query(
-      "INSERT INTO journal_lines (journal_entry_id, account_id, partner_id, debit, credit, analytic_tag) VALUES (?, ?, ?, ?, ?, ?)",
-      [journalEntryId, line.accountId, line.partnerId ?? null, line.debit, line.credit, line.analyticTag ?? null]
+      "INSERT INTO journal_lines (journal_entry_id, account_id, partner_id, debit, credit, analytic_tag, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [journalEntryId, line.accountId, line.partnerId ?? null, line.debit, line.credit, line.analyticTag ?? null, line.description ?? null]
     );
   }
 
@@ -63,12 +69,13 @@ export async function postJournalEntry(
 
 let accountIdCache = new Map<string, number>();
 
-export async function getAccountIdByCode(code: string): Promise<number> {
-  if (accountIdCache.has(code)) return accountIdCache.get(code)!;
-  const [rows] = await pool.query("SELECT id FROM accounts WHERE code = ?", [code]);
+export async function getAccountIdByCode(code: string, businessUnit: BusinessUnit = "zarve"): Promise<number> {
+  const cacheKey = `${businessUnit}:${code}`;
+  if (accountIdCache.has(cacheKey)) return accountIdCache.get(cacheKey)!;
+  const [rows] = await pool.query("SELECT id FROM accounts WHERE code = ? AND business_unit = ?", [code, businessUnit]);
   const row = (rows as any[])[0];
   if (!row) throw new ApiError(500, `Akun dengan kode ${code} tidak ditemukan di chart of accounts`);
-  accountIdCache.set(code, row.id);
+  accountIdCache.set(cacheKey, row.id);
   return row.id;
 }
 
