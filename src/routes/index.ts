@@ -28,6 +28,7 @@ import { productCategoriesRouter } from "./productCategories.routes";
 import { warehousesRouter } from "./warehouses.routes";
 import { stockAdjustmentsRouter } from "./stockAdjustments.routes";
 import { warehouseTransfersRouter } from "./warehouseTransfers.routes";
+import { contactsRouter } from "./contacts.routes";
 
 export const apiRouter = Router();
 
@@ -61,3 +62,4 @@ apiRouter.use("/product-categories", productCategoriesRouter);
 apiRouter.use("/warehouses", warehousesRouter);
 apiRouter.use("/stock-adjustments", stockAdjustmentsRouter);
 apiRouter.use("/warehouse-transfers", warehouseTransfersRouter);
+apiRouter.use("/contacts", contactsRouter);
