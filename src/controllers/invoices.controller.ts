@@ -25,6 +25,8 @@ function mapLineRow(row: any): InvoiceLine {
     description: row.description,
     category: row.category,
     accountId: row.account_id,
+    accountCode: row.account_code,
+    accountName: row.account_name,
     amount: Number(row.amount),
     taxRate: Number(row.tax_rate),
     taxAmount: Number(row.tax_amount),
@@ -175,11 +177,81 @@ export const invoicesController = {
   },
 
   async get(req: Request, res: Response) {
-    const [rows] = await pool.query("SELECT * FROM invoices WHERE id = ?", [req.params.id]);
+    const [rows] = await pool.query(
+      `SELECT i.*, p.name AS partner_name, v.plate_number AS vehicle_plate_number,
+         COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id = i.id), 0) AS amount_paid
+       FROM invoices i
+       JOIN partners p ON p.id = i.partner_id
+       LEFT JOIN vehicles v ON v.id = i.vehicle_id
+       WHERE i.id = ?`,
+      [req.params.id]
+    );
     const row = (rows as any[])[0];
     if (!row) throw new ApiError(404, "Invoice tidak ditemukan");
-    const [lineRows] = await pool.query("SELECT * FROM invoice_lines WHERE invoice_id = ?", [req.params.id]);
-    res.json({ ...mapInvoiceRow(row), lines: (lineRows as any[]).map(mapLineRow) });
+    const [lineRows] = await pool.query(
+      `SELECT il.*, a.code AS account_code, a.name AS account_name
+       FROM invoice_lines il
+       JOIN accounts a ON a.id = il.account_id
+       WHERE il.invoice_id = ?`,
+      [req.params.id]
+    );
+    // This invoice is a monthly recap (see zarveSync.controller.ts) -- one local line
+    // stands in for a whole month of the driver's individual daily Zarve invoices, so
+    // its own number never matches anything the driver/staff sees in Zarve. Reconstruct
+    // the underlying Zarve invoices by matching driver name + vehicle plate + the
+    // invoice's own month, upper-bounded by whichever is earlier: the end of that
+    // month, or this recap's own creation date. Both bounds matter -- a month synced
+    // mid-way through (created_at falls inside it) must stop there since only days up
+    // to that point had contributed to the total yet; a month synced late, as a
+    // catch-up run well after it ended (created_at falls in a LATER month), must still
+    // stop at that month's own last day, or the range leaks into whichever later month
+    // the catch-up run happened to land in and pulls in unrelated invoices.
+    //
+    // Only show source invoices that are actually still outstanding (total >
+    // amount_paid), not the whole month's daily invoices -- a driver who paid on time
+    // has ~30 PAID daily invoices behind one recap, and showing all of them next to a
+    // small "Sisa" made the list look like a data bug ("sisa 600rb tapi riwayat banyak
+    // banget") when in fact only 1-2 of those days were actually unpaid. This also
+    // means we don't need to filter by zi.status (which keeps moving after sync time,
+    // see findInvoiceByKey's skip-if-exists behavior) -- total > amount_paid reflects
+    // Zarve's current reality directly regardless of which status label is attached.
+    //
+    // vehicle_plate/driver_name are stripped of spaces AND tabs/newlines before
+    // comparing: some rows mirrored from Zarve carry a literal tab character glued to
+    // the plate (e.g. "\t B 1061 FNS"), which silently broke the space-only REPLACE
+    // and made the match return zero rows for those invoices.
+    const [sourceRows] = await pool.query(
+      `SELECT zi.id, zi.invoice_number, zi.invoice_date, zi.total, zi.amount_paid, zi.status
+       FROM zarve_invoices zi
+       WHERE REPLACE(REPLACE(REPLACE(REPLACE(UPPER(zi.driver_name), ' ', ''), CHAR(9), ''), CHAR(13), ''), CHAR(10), '')
+             = REPLACE(REPLACE(REPLACE(REPLACE(UPPER(?), ' ', ''), CHAR(9), ''), CHAR(13), ''), CHAR(10), '')
+         AND REPLACE(REPLACE(REPLACE(REPLACE(UPPER(zi.vehicle_plate), ' ', ''), CHAR(9), ''), CHAR(13), ''), CHAR(10), '')
+             = REPLACE(REPLACE(REPLACE(REPLACE(UPPER(?), ' ', ''), CHAR(9), ''), CHAR(13), ''), CHAR(10), '')
+         AND zi.type = 'DAILY'
+         AND zi.invoice_date >= DATE_FORMAT(?, '%Y-%m-01')
+         AND zi.invoice_date <= LEAST(LAST_DAY(?), DATE(?))
+         AND zi.total > zi.amount_paid
+       ORDER BY zi.invoice_date`,
+      [row.partner_name, row.ref ?? row.vehicle_plate_number ?? "", row.invoice_date, row.invoice_date, row.created_at]
+    );
+
+    const amountPaid = Number(row.amount_paid);
+    res.json({
+      ...mapInvoiceRow(row),
+      partnerName: row.partner_name,
+      vehiclePlateNumber: row.vehicle_plate_number,
+      amountPaid,
+      outstanding: Math.max(Number(row.total_amount) - amountPaid, 0),
+      lines: (lineRows as any[]).map(mapLineRow),
+      sourceInvoices: (sourceRows as any[]).map((r) => ({
+        zarveInvoiceId: r.id,
+        invoiceNumber: r.invoice_number,
+        invoiceDate: r.invoice_date,
+        total: Number(r.total),
+        amountPaid: Number(r.amount_paid),
+        status: r.status,
+      })),
+    });
   },
 
   async create(req: Request, res: Response) {

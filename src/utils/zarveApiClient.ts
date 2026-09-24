@@ -107,6 +107,14 @@ async function zarveGetRaw<T extends { success: boolean; message?: string }>(
         `Token Zarve API sudah tidak valid/expired -- minta salah satu user login ulang ke rve-finance supaya token-nya ke-refresh. (${message})`
       );
     }
+    // Preserve a real 404 as a 404 (not the generic 502 below) -- callers that mirror
+    // Zarve data locally (e.g. zarveInvoicesController.detail) use this to tell "the
+    // record genuinely doesn't exist upstream anymore" apart from a transient/auth
+    // failure, and react differently (self-heal the stale mirror row instead of just
+    // surfacing a scary error).
+    if (res.status === 404) {
+      throw new ApiError(404, message);
+    }
     throw new ApiError(502, `Gagal mengambil data dari Zarve API: ${message}`);
   }
 

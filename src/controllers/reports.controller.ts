@@ -144,20 +144,35 @@ export const reportsController = {
    */
   async agedReceivables(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
+    // Optional -- the detail page for one driver/customer reuses this same endpoint
+    // and computation instead of duplicating the bucket math.
+    const partnerId = req.query.partnerId ? Number(req.query.partnerId) : undefined;
 
     const [rows] = await pool.query(
-      `SELECT i.id, i.partner_id, p.name AS partner_name, i.invoice_date, i.total_amount,
+      `SELECT i.id, i.number, i.partner_id, p.name AS partner_name, i.invoice_date, i.total_amount,
          COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id = i.id AND date <= ?), 0) AS paid
        FROM invoices i
        JOIN partners p ON p.id = i.partner_id
-       WHERE i.invoice_date <= ?`,
-      [asOf, asOf]
+       WHERE i.invoice_date <= ? ${partnerId ? "AND i.partner_id = ?" : ""}`,
+      partnerId ? [asOf, asOf, partnerId] : [asOf, asOf]
     );
 
     const asOfMs = new Date(asOf).getTime();
+    type Bucket = "current" | "d1to30" | "d31to60" | "d61to90" | "d90plus";
+    type InvoiceDetail = { invoiceId: number; invoiceNumber: string; invoiceDate: string; totalAmount: number; paid: number; outstanding: number; bucket: Bucket };
     const byPartner = new Map<
       number,
-      { partnerId: number; partnerName: string; current: number; d1to30: number; d31to60: number; d61to90: number; d90plus: number; total: number }
+      {
+        partnerId: number;
+        partnerName: string;
+        current: number;
+        d1to30: number;
+        d31to60: number;
+        d61to90: number;
+        d90plus: number;
+        total: number;
+        invoices: InvoiceDetail[];
+      }
     >();
 
     for (const r of rows as any[]) {
@@ -166,17 +181,27 @@ export const reportsController = {
 
       let entry = byPartner.get(r.partner_id);
       if (!entry) {
-        entry = { partnerId: r.partner_id, partnerName: r.partner_name, current: 0, d1to30: 0, d31to60: 0, d61to90: 0, d90plus: 0, total: 0 };
+        entry = { partnerId: r.partner_id, partnerName: r.partner_name, current: 0, d1to30: 0, d31to60: 0, d61to90: 0, d90plus: 0, total: 0, invoices: [] };
         byPartner.set(r.partner_id, entry);
       }
 
       const days = Math.floor((asOfMs - new Date(r.invoice_date).getTime()) / (24 * 60 * 60 * 1000));
-      if (days <= 0) entry.current += outstanding;
-      else if (days <= 30) entry.d1to30 += outstanding;
-      else if (days <= 60) entry.d31to60 += outstanding;
-      else if (days <= 90) entry.d61to90 += outstanding;
-      else entry.d90plus += outstanding;
+      const bucket: Bucket = days <= 0 ? "current" : days <= 30 ? "d1to30" : days <= 60 ? "d31to60" : days <= 90 ? "d61to90" : "d90plus";
+      entry[bucket] += outstanding;
       entry.total += outstanding;
+      entry.invoices.push({
+        invoiceId: r.id,
+        invoiceNumber: r.number,
+        invoiceDate: r.invoice_date,
+        totalAmount: Number(r.total_amount),
+        paid: Number(r.paid),
+        outstanding,
+        bucket,
+      });
+    }
+
+    for (const entry of byPartner.values()) {
+      entry.invoices.sort((a, b) => new Date(a.invoiceDate).getTime() - new Date(b.invoiceDate).getTime());
     }
 
     const partners = Array.from(byPartner.values()).sort((a, b) => b.total - a.total);

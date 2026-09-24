@@ -115,6 +115,8 @@ export interface InvoiceLine {
   description: string;
   category: InvoiceLineCategory;
   accountId: number;
+  accountCode: string;
+  accountName: string;
   amount: number;
   taxRate: number;
   taxAmount: number;

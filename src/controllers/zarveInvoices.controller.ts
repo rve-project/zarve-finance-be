@@ -63,7 +63,22 @@ export const zarveInvoicesController = {
   async detail(req: Request, res: Response) {
     const id = req.params.id as string;
     if (!id) throw new ApiError(400, "id wajib diisi");
-    const invoice = await getInvoiceDetail(id);
-    res.json(invoice);
+    try {
+      const invoice = await getInvoiceDetail(id);
+      res.json(invoice);
+    } catch (err) {
+      // The one-way mirror sync (zarveMirrorSync.ts) only ever inserts/updates --
+      // it never notices when Zarve deletes/cancels an invoice after it was synced.
+      // A 404 here means this specific row genuinely doesn't exist upstream anymore
+      // (verified: Zarve's own long-running daily-rental bookings can pre-generate
+      // years of future invoices that later get regenerated/removed on their side).
+      // Self-heal by dropping the stale row so the list stops offering it, instead of
+      // just surfacing a scary error every time someone clicks it again.
+      if (err instanceof ApiError && err.statusCode === 404) {
+        await pool.query("DELETE FROM zarve_invoices WHERE id = ?", [id]);
+        throw new ApiError(404, "Invoice ini sudah tidak ada di sistem Zarve (kemungkinan sudah dihapus/dibatalkan). Sudah dibersihkan dari daftar.");
+      }
+      throw err;
+    }
   },
 };

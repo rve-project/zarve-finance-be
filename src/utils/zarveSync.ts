@@ -26,6 +26,13 @@ export interface ZarveSyncRow {
   warnings: string[];
 }
 
+// Zarve statuses that zero out a daily invoice's bill: COMPLIMENTARY is "Gratis /
+// Internal" (Zarve sets its revenue to 0) and VOID is a cancelled invoice. Zarve still
+// reports the original `total` on both, with `amountPaid` 0 -- counting that total would
+// post it as a receivable that can never be collected. Mirrors Zarve's own
+// invoice-outstanding page, which excludes both from what a driver owes.
+export const ZERO_BILL_STATUSES = ["COMPLIMENTARY", "VOID"];
+
 function toNumber(v: string | number): number {
   return typeof v === "number" ? v : Number(v) || 0;
 }
@@ -54,6 +61,7 @@ export function buildSyncRows(invoices: ZarveInvoice[], companyNames: Map<string
     const vehicle = inv.booking?.vehicle;
     const driver = inv.booking?.driver;
     if (!inv.bookingId || !vehicle?.plateNumber) continue;
+    if (ZERO_BILL_STATUSES.includes(inv.status ?? "")) continue;
 
     const key = `${inv.bookingId}:${month}`;
     let row = groups.get(key);
