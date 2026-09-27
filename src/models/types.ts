@@ -18,6 +18,7 @@ export interface Account {
   description: string | null;
   categoryId: number | null;
   taxId: number | null;
+  bankName: string | null;
   /** "all" (default) or "some" -- restricted to specific users via
    * account_access_users (see accounts.controller.ts's get/create/update, which are
    * the only places that also expose the actual accessUserIds list). There is no
@@ -46,6 +47,15 @@ export interface TaxCode {
   isActive: boolean;
 }
 
+/** "Nama bank" list for the Kas & Bank account create form -- editable via Settings,
+ * same pattern as TaxCode. */
+export interface Bank {
+  id: number;
+  businessUnit: BusinessUnit;
+  name: string;
+  isActive: boolean;
+}
+
 export type PartnerType = "customer" | "vendor";
 
 export interface Partner {
@@ -71,7 +81,17 @@ export interface Vehicle {
   analyticTag: string | null;
 }
 
-export type JournalSourceType = "invoice" | "payment" | "manual" | "vendor_bill" | "vendor_payment";
+export type JournalSourceType =
+  | "invoice"
+  | "payment"
+  | "manual"
+  | "vendor_bill"
+  | "vendor_payment"
+  | "expense"
+  | "purchase_invoice"
+  | "purchase_payment"
+  | "sale_invoice"
+  | "sale_payment";
 
 export interface JournalEntry {
   id: number;
@@ -317,21 +337,44 @@ export interface WarehouseTransfer {
 // "Kontak" -- a B2B-only contact book (Pelanggan/Supplier/Karyawan/Lainnya), a separate
 // table from `partners` (which is tied to Zarve's driver-import matching logic). No
 // AR/AP balance tracking exists for B2B yet, so "Saldo" is always 0 for now. See
-// migrations/032_contacts.sql.
+// migrations/032_contacts.sql, extended in 037_contact_details.sql.
 export type ContactType = "customer" | "vendor" | "employee" | "other";
+export type Citizenship = "wni" | "wna";
+
+export interface ContactBankAccount {
+  id: number;
+  bankName: string | null;
+  branch: string | null;
+  accountHolder: string | null;
+  accountNumber: string | null;
+}
 
 export interface Contact {
   id: number;
   businessUnit: BusinessUnit;
-  type: ContactType;
+  types: ContactType[];
   name: string;
+  salutation: string | null;
+  firstName: string | null;
+  middleName: string | null;
+  lastName: string | null;
   companyName: string | null;
   address: string | null;
+  shippingAddress: string | null;
   email: string | null;
   mobilePhone: string | null;
   phone: string | null;
+  fax: string | null;
+  citizenship: Citizenship;
   npwp: string | null;
+  idType: string | null;
+  idNumber: string | null;
+  nitku: string | null;
+  paymentTerm: string | null;
+  receivableAccountId: number | null;
+  payableAccountId: number | null;
   notes: string | null;
   isActive: boolean;
   createdAt: string;
+  bankAccounts: ContactBankAccount[];
 }

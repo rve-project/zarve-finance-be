@@ -5,15 +5,18 @@ import { ApiError } from "../middlewares/errorHandler";
 import { WELL_KNOWN_ACCOUNTS } from "../utils/ledger";
 
 /**
- * "Kas & Bank" overview: for each cash/bank account (asset, code prefix '11', same
- * convention as reconciliation.controller.ts and reports.controller.ts's cashFlow),
- * shows "Saldo di Jurnal" (the real ledger balance -- always accurate) next to
- * "Saldo bank" (whatever was last imported from a bank statement file -- see
- * importStatement below). There's no live bank connection in this app; the two
- * figures only agree once someone imports a statement and/or reconciles.
+ * "Kas & Bank" overview: for each cash/bank account (identified by its "Cash & Bank"
+ * account_categories row -- B2B's codes don't follow a fixed prefix convention like
+ * Zarve's do, see reconciliation.controller.ts/reports.controller.ts's cashFlow for
+ * that older code-prefix approach, which only ever applied to Zarve), shows "Saldo di
+ * Jurnal" (the real ledger balance -- always accurate) next to "Saldo bank" (whatever
+ * was last imported from a bank statement file -- see importStatement below). There's
+ * no live bank connection in this app; the two figures only agree once someone
+ * imports a statement and/or reconciles.
  */
 
-const CASH_BANK_WHERE = "a.business_unit = ? AND a.type = 'asset' AND a.code LIKE '11%' AND a.code != ?";
+const CASH_BANK_JOIN = "JOIN account_categories cat ON cat.id = a.category_id AND cat.value = 'cash_bank'";
+const CASH_BANK_WHERE = "a.business_unit = ? AND a.code != ?";
 
 export const cashBankController = {
   async accounts(req: Request, res: Response) {
@@ -30,6 +33,7 @@ export const cashBankController = {
            LIMIT 1
          ) AS saldo_bank
        FROM accounts a
+       ${CASH_BANK_JOIN}
        LEFT JOIN journal_lines jl ON jl.account_id = a.id
        LEFT JOIN journal_entries je ON je.id = jl.journal_entry_id
        WHERE ${CASH_BANK_WHERE} ${activeClause}
@@ -61,6 +65,7 @@ export const cashBankController = {
        FROM journal_lines jl
        JOIN journal_entries je ON je.id = jl.journal_entry_id
        JOIN accounts a ON a.id = jl.account_id
+       ${CASH_BANK_JOIN}
        WHERE ${CASH_BANK_WHERE} AND je.date > ? AND je.date <= ?`,
       [req.businessUnit, WELL_KNOWN_ACCOUNTS.UNDEPOSITED_FUNDS, today, in30Days]
     );
@@ -69,6 +74,7 @@ export const cashBankController = {
     const [balanceRows] = await pool.query(
       `SELECT a.id, COALESCE(SUM(CASE WHEN je.date <= ? THEN jl.debit - jl.credit ELSE 0 END), 0) AS saldo
        FROM accounts a
+       ${CASH_BANK_JOIN}
        LEFT JOIN journal_lines jl ON jl.account_id = a.id
        LEFT JOIN journal_entries je ON je.id = jl.journal_entry_id
        WHERE ${CASH_BANK_WHERE} AND a.is_active = TRUE
@@ -89,6 +95,112 @@ export const cashBankController = {
       // always zero until one is modeled. Not a bug, just nothing to report.
       saldoKartuKredit: 0,
       saldoKartuKreditCount: 0,
+    });
+  },
+
+  /**
+   * Full transaction ledger for one cash/bank account (date, a title/subtitle the
+   * frontend derives from source_type + doc number, contact name, debit/credit, and a
+   * running balance computed via window function -- same technique reportEngine.ts's
+   * getGeneralLedgerLines uses for the General Ledger report, just without a date range
+   * and with richer source/contact resolution than that shared helper has).
+   *
+   * Contact name is resolved by walking source_type/source_id back to
+   * purchase_documents/sale_documents/expenses (through purchase_payments/
+   * sale_payments for the *_payment source types, since their source_id is the
+   * payment's own id, not the document's) -- NOT via journal_lines.partner_id, which
+   * is a pre-existing FK to Zarve's `partners` table and doesn't hold a B2B contact id
+   * correctly. See purchases/sales/expenses controllers, which pass a contacts.id as
+   * partnerId; that's a latent bug elsewhere, not something to build on further here.
+   */
+  async ledger(req: Request, res: Response) {
+    const accountId = Number(req.params.accountId);
+    const [accountRows] = await pool.query("SELECT * FROM accounts WHERE id = ?", [accountId]);
+    const account = (accountRows as any[])[0];
+    if (!account || account.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
+
+    const search = (req.query.search as string | undefined)?.trim();
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const limit = req.query.limit ? Number(req.query.limit) : 25;
+
+    const baseQuery = `
+      FROM journal_lines jl
+      JOIN journal_entries je ON je.id = jl.journal_entry_id
+      LEFT JOIN purchase_documents pd ON je.source_type = 'purchase_invoice' AND pd.id = je.source_id
+      LEFT JOIN purchase_payments pp ON je.source_type = 'purchase_payment' AND pp.id = je.source_id
+      LEFT JOIN purchase_documents pd2 ON pd2.id = pp.document_id
+      LEFT JOIN sale_documents sd ON je.source_type = 'sale_invoice' AND sd.id = je.source_id
+      LEFT JOIN sale_payments sp ON je.source_type = 'sale_payment' AND sp.id = je.source_id
+      LEFT JOIN sale_documents sd2 ON sd2.id = sp.document_id
+      LEFT JOIN expenses ex ON je.source_type = 'expense' AND ex.id = je.source_id
+      LEFT JOIN contacts c ON c.id = COALESCE(pd.contact_id, pd2.contact_id, sd.contact_id, sd2.contact_id, ex.contact_id)
+      LEFT JOIN partners p ON p.id = jl.partner_id
+      WHERE jl.account_id = ?`;
+
+    let searchClause = "";
+    const searchParams: unknown[] = [];
+    if (search) {
+      searchClause = ` AND (je.ref LIKE ? OR je.narration LIKE ? OR jl.description LIKE ? OR
+        COALESCE(pd.number, pd2.number, sd.number, sd2.number, ex.number) LIKE ? OR
+        COALESCE(c.name, p.name) LIKE ?)`;
+      searchParams.push(...Array(5).fill(`%${search}%`));
+    }
+
+    const [countRows] = await pool.query(`SELECT COUNT(*) AS cnt ${baseQuery}${searchClause}`, [accountId, ...searchParams]);
+    const total = (countRows as any[])[0].cnt as number;
+
+    // The true ending balance is always over this account's whole (unfiltered)
+    // history -- a search narrows which rows are *displayed*, not what the account
+    // actually holds.
+    const [endRows] = await pool.query(`SELECT COALESCE(SUM(jl.debit - jl.credit), 0) AS end_balance ${baseQuery}`, [accountId]);
+
+    // Running balance is likewise computed over the full unfiltered history inside the
+    // window-function subquery, then the search filter (if any) narrows the outer
+    // SELECT afterward -- so a searched-for row still shows its true cumulative
+    // balance, not one relative to only the matching rows.
+    const [rows] = await pool.query(
+      `SELECT * FROM (
+         SELECT je.date, je.ref, je.narration, je.source_type, jl.id AS line_id, jl.debit, jl.credit,
+           jl.description AS line_description,
+           COALESCE(pd.number, pd2.number, sd.number, sd2.number, ex.number) AS doc_number,
+           COALESCE(c.name, p.name) AS contact_name,
+           CASE
+             WHEN pd.id IS NOT NULL OR pd2.id IS NOT NULL THEN 'purchase'
+             WHEN sd.id IS NOT NULL OR sd2.id IS NOT NULL THEN 'sale'
+             WHEN ex.id IS NOT NULL THEN 'expense'
+             ELSE NULL
+           END AS doc_kind,
+           COALESCE(pd.id, pd2.id, sd.id, sd2.id, ex.id) AS doc_id,
+           SUM(jl.debit - jl.credit) OVER (ORDER BY je.date, jl.id) AS running_balance
+         ${baseQuery}
+       ) t
+       ${searchClause ? `WHERE ref LIKE ? OR narration LIKE ? OR line_description LIKE ? OR doc_number LIKE ? OR contact_name LIKE ?` : ""}
+       ORDER BY date, line_id
+       LIMIT ? OFFSET ?`,
+      [accountId, ...searchParams, limit, (page - 1) * limit]
+    );
+
+    res.json({
+      accountId,
+      total,
+      page,
+      limit,
+      endBalance: Number((endRows as any[])[0].end_balance),
+      lines: (rows as any[]).map((r) => ({
+        lineId: r.line_id,
+        date: r.date,
+        ref: r.ref,
+        narration: r.narration,
+        sourceType: r.source_type,
+        docNumber: r.doc_number,
+        docKind: r.doc_kind,
+        docId: r.doc_id,
+        lineDescription: r.line_description,
+        contactName: r.contact_name,
+        debit: Number(r.debit),
+        credit: Number(r.credit),
+        runningBalance: Number(r.running_balance),
+      })),
     });
   },
 

@@ -18,6 +18,7 @@ function mapRow(row: any): Account {
     description: row.description,
     categoryId: row.category_id,
     taxId: row.tax_id,
+    bankName: row.bank_name,
     accessMode: row.access_mode,
   };
 }
@@ -38,15 +39,21 @@ async function setAccessUserIds(accountId: number, userIds: number[]): Promise<v
 
 export const accountsController = {
   async list(req: Request, res: Response) {
-    const { type } = req.query;
-    const clauses: string[] = ["business_unit = ?"];
+    const { type, category } = req.query;
+    const clauses: string[] = ["accounts.business_unit = ?"];
     const params: unknown[] = [req.businessUnit];
     if (type) {
-      clauses.push("type = ?");
+      clauses.push("accounts.type = ?");
       params.push(type);
     }
+    const joinParams: unknown[] = [];
+    let join = "";
+    if (category) {
+      join = "JOIN account_categories c ON c.id = accounts.category_id AND c.value = ?";
+      joinParams.push(category);
+    }
     const where = `WHERE ${clauses.join(" AND ")}`;
-    const [rows] = await pool.query(`SELECT * FROM accounts ${where} ORDER BY code`, params);
+    const [rows] = await pool.query(`SELECT accounts.* FROM accounts ${join} ${where} ORDER BY code`, [...joinParams, ...params]);
     res.json((rows as any[]).map(mapRow));
   },
 
@@ -59,7 +66,7 @@ export const accountsController = {
   },
 
   async create(req: Request, res: Response) {
-    const { code, name, type, parentId, description, categoryId, taxId, accessMode, accessUserIds } = req.body;
+    const { code, name, type, parentId, description, categoryId, taxId, bankName, accessMode, accessUserIds } = req.body;
 
     let resolvedType = type;
     if (categoryId) {
@@ -76,8 +83,19 @@ export const accountsController = {
     const resolvedAccessMode: AccountAccessMode = ACCESS_MODES.includes(accessMode) ? accessMode : "all";
 
     const [result] = await pool.query(
-      "INSERT INTO accounts (code, name, type, parent_id, business_unit, description, category_id, tax_id, access_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [code, name, resolvedType, parentId ?? null, req.businessUnit, description ?? null, categoryId ?? null, taxId ?? null, resolvedAccessMode]
+      "INSERT INTO accounts (code, name, type, parent_id, business_unit, description, category_id, tax_id, bank_name, access_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        code,
+        name,
+        resolvedType,
+        parentId ?? null,
+        req.businessUnit,
+        description ?? null,
+        categoryId ?? null,
+        taxId ?? null,
+        bankName ?? null,
+        resolvedAccessMode,
+      ]
     );
     const insertId = (result as any).insertId;
 
@@ -89,7 +107,7 @@ export const accountsController = {
   },
 
   async update(req: Request, res: Response) {
-    const { name, isActive, parentId, description, categoryId, taxId, accessMode, accessUserIds } = req.body;
+    const { name, isActive, parentId, description, categoryId, taxId, bankName, accessMode, accessUserIds } = req.body;
     const [existing] = await pool.query("SELECT * FROM accounts WHERE id = ?", [req.params.id]);
     const current = (existing as any[])[0];
     if (!current || current.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
@@ -97,7 +115,7 @@ export const accountsController = {
     const resolvedAccessMode: AccountAccessMode = ACCESS_MODES.includes(accessMode) ? accessMode : current.access_mode;
 
     await pool.query(
-      "UPDATE accounts SET name = ?, is_active = ?, parent_id = ?, description = ?, category_id = ?, tax_id = ?, access_mode = ? WHERE id = ?",
+      "UPDATE accounts SET name = ?, is_active = ?, parent_id = ?, description = ?, category_id = ?, tax_id = ?, bank_name = ?, access_mode = ? WHERE id = ?",
       [
         name ?? current.name,
         isActive === undefined ? current.is_active : isActive,
@@ -105,6 +123,7 @@ export const accountsController = {
         description === undefined ? current.description : description,
         categoryId === undefined ? current.category_id : categoryId,
         taxId === undefined ? current.tax_id : taxId,
+        bankName === undefined ? current.bank_name : bankName,
         resolvedAccessMode,
         req.params.id,
       ]

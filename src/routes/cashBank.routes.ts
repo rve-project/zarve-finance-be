@@ -9,6 +9,7 @@ export const cashBankRouter = Router();
 
 cashBankRouter.use(requireAuth);
 cashBankRouter.get("/accounts", cashBankController.accounts);
+cashBankRouter.get("/accounts/:accountId/ledger", cashBankController.ledger);
 cashBankRouter.get("/summary", cashBankController.summary);
 cashBankRouter.get("/import-template", cashBankController.downloadTemplate);
 cashBankRouter.post("/accounts/:accountId/import", upload.single("file"), cashBankController.importStatement);

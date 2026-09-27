@@ -71,6 +71,7 @@ export async function getAccountBalances(params: {
       description: row.description,
       categoryId: row.category_id,
       taxId: row.tax_id,
+      bankName: null,
       accessMode: row.access_mode,
     };
     return {

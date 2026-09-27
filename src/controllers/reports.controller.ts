@@ -105,14 +105,29 @@ export const reportsController = {
   },
 
   /**
-   * Simplified cash flow: net movement on Bank/Cash accounts (code prefix '11') within
-   * the period. Does NOT split into operating/investing/financing like Odoo's version --
-   * flagged in the plan as a follow-up refinement, not silently under-built.
+   * Simplified cash flow: net movement on Bank/Cash accounts within the period. Does
+   * NOT split into operating/investing/financing like Odoo's version -- flagged in the
+   * plan as a follow-up refinement, not silently under-built.
+   *
+   * Zarve accounts don't use account_categories at all (see migration
+   * 017_account_categories_and_taxes.sql), so Zarve keeps its old code-prefix '11'
+   * convention; B2B's codes don't follow that convention (see 034_full_b2b_coa.sql),
+   * so B2B instead matches its "Cash & Bank" category.
    */
   async cashFlow(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
     const rows = await getAccountBalances({ from, to, types: ["asset"], businessUnit: req.businessUnit });
-    const cashAccounts = rows.filter((r) => r.account.code.startsWith("11"));
+
+    let cashAccounts;
+    if (req.businessUnit === "b2b") {
+      const [catRows] = await pool.query(
+        "SELECT id FROM account_categories WHERE business_unit = 'b2b' AND value = 'cash_bank'"
+      );
+      const cashBankCategoryId = (catRows as any[])[0]?.id;
+      cashAccounts = rows.filter((r) => r.account.categoryId === cashBankCategoryId);
+    } else {
+      cashAccounts = rows.filter((r) => r.account.code.startsWith("11"));
+    }
 
     const beginningBalance = cashAccounts.reduce((sum, r) => sum + r.initialBalance, 0);
     const endingBalance = cashAccounts.reduce((sum, r) => sum + r.endBalance, 0);
