@@ -13,3 +13,4 @@ reportsRouter.get("/cash-flow", reportsController.cashFlow);
 reportsRouter.get("/aged-receivables", reportsController.agedReceivables);
 reportsRouter.get("/vehicle-profitability", reportsController.vehicleProfitability);
 reportsRouter.get("/geofence-violations", reportsController.geofenceViolations);
+reportsRouter.get("/journal-validation", reportsController.journalValidation);

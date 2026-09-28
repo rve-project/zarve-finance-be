@@ -33,6 +33,7 @@ import { contactsRouter } from "./contacts.routes";
 import { expensesRouter } from "./expenses.routes";
 import { purchasesRouter } from "./purchases.routes";
 import { salesRouter } from "./sales.routes";
+import { activityLogsRouter } from "./activityLogs.routes";
 
 export const apiRouter = Router();
 
@@ -71,3 +72,4 @@ apiRouter.use("/contacts", contactsRouter);
 apiRouter.use("/expenses", expensesRouter);
 apiRouter.use("/purchases", purchasesRouter);
 apiRouter.use("/sales", salesRouter);
+apiRouter.use("/activity-logs", activityLogsRouter);

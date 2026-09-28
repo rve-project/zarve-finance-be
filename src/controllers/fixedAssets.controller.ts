@@ -17,6 +17,8 @@ function mapAssetRow(row: any) {
     assetNumber: row.asset_number,
     name: row.name,
     description: row.description,
+    assetType: row.asset_type,
+    plateNumber: row.plate_number,
     categoryAccountId: row.category_account_id,
     categoryAccountCode: row.category_account_code,
     categoryAccountName: row.category_account_name,
@@ -206,6 +208,8 @@ export const fixedAssetsController = {
       acquisitionCost,
       creditAccountId,
       description,
+      assetType,
+      plateNumber,
       isNonDepreciating,
       depreciationMethod,
       usefulLifeYears,
@@ -221,6 +225,10 @@ export const fixedAssetsController = {
     }
     if (!isNonDepreciating && !sourceJournalLineId && (!usefulLifeYears || Number(usefulLifeYears) <= 0)) {
       throw new ApiError(400, "Masa manfaat wajib diisi untuk aset yang disusutkan");
+    }
+    const finalAssetType = assetType === "vehicle" ? "vehicle" : "general";
+    if (finalAssetType === "vehicle" && !plateNumber) {
+      throw new ApiError(400, "Plat nomor wajib diisi untuk aset berupa kendaraan operasional");
     }
 
     const finalAssetNumber = assetNumber || (await nextAssetNumber(req.businessUnit));
@@ -256,16 +264,18 @@ export const fixedAssetsController = {
 
     const [result] = await pool.query(
       `INSERT INTO fixed_assets (
-         business_unit, asset_number, name, description, category_account_id, acquisition_date, acquisition_cost,
+         business_unit, asset_number, name, description, asset_type, plate_number, category_account_id, acquisition_date, acquisition_cost,
          credit_account_id, is_non_depreciating, depreciation_method, useful_life_years,
          depreciation_expense_account_id, accumulated_depreciation_account_id,
          opening_accumulated_depreciation, opening_accumulated_depreciation_date, purchase_journal_entry_id
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         req.businessUnit,
         finalAssetNumber,
         name,
         description || null,
+        finalAssetType,
+        finalAssetType === "vehicle" ? String(plateNumber).trim() : null,
         Number(categoryAccountId),
         acquisitionDate,
         Number(acquisitionCost),
@@ -350,5 +360,120 @@ export const fixedAssetsController = {
     );
 
     res.status(201).json({ disposalJournalEntryId, bookValueAtDisposal: dep.bookValue, gainLoss });
+  },
+
+  /**
+   * Revaluation / impairment: "rebase" the asset's book value to `newValue` as of
+   * `revaluationDate`. Posts a journal entry for the difference (debit the asset account
+   * for a surplus, credit it for an impairment -- against whatever contra account the
+   * user picks), then rewrites acquisition_cost/acquisition_date/opening_accumulated_
+   * depreciation so computeDepreciation() (utils/depreciation.ts, unchanged) keeps
+   * computing book value correctly going forward. Each rebase is kept in
+   * fixed_asset_revaluations for history instead of silently overwriting.
+   */
+  async revalue(req: Request, res: Response) {
+    const { revaluationDate, newValue, adjustmentAccountId, notes } = req.body;
+    if (!revaluationDate || newValue === undefined || newValue === null || !adjustmentAccountId) {
+      throw new ApiError(400, "Tanggal, nilai baru, dan akun penyesuaian wajib diisi");
+    }
+
+    const [rows] = await pool.query("SELECT * FROM fixed_assets WHERE id = ?", [req.params.id]);
+    const row = (rows as any[])[0];
+    if (!row || row.business_unit !== req.businessUnit) throw new ApiError(404, "Aset tidak ditemukan");
+    if (row.status === "disposed") throw new ApiError(400, "Aset yang sudah dilepas tidak bisa direvaluasi");
+
+    const asset = mapAssetRow(row);
+    const dep = computeDepreciation(
+      {
+        acquisitionDate: asset.acquisitionDate,
+        acquisitionCost: asset.acquisitionCost,
+        isNonDepreciating: asset.isNonDepreciating,
+        usefulLifeYears: asset.usefulLifeYears,
+        openingAccumulatedDepreciation: asset.openingAccumulatedDepreciation,
+      },
+      revaluationDate
+    );
+
+    const newValueNum = Number(newValue);
+    const adjustment = Math.round((newValueNum - dep.bookValue) * 100) / 100;
+    if (adjustment === 0) throw new ApiError(400, "Nilai baru sama dengan nilai buku saat ini -- tidak ada penyesuaian yang perlu diposting");
+
+    const lines =
+      adjustment > 0
+        ? [
+            { accountId: asset.categoryAccountId, debit: adjustment, credit: 0 },
+            { accountId: Number(adjustmentAccountId), debit: 0, credit: adjustment },
+          ]
+        : [
+            { accountId: Number(adjustmentAccountId), debit: -adjustment, credit: 0 },
+            { accountId: asset.categoryAccountId, debit: 0, credit: -adjustment },
+          ];
+
+    const journalEntryId = await postJournalEntry({
+      date: revaluationDate,
+      ref: `REVAL-${asset.assetNumber}`,
+      narration: `Revaluasi aset tetap: ${asset.name}`,
+      sourceType: "manual",
+      businessUnit: req.businessUnit,
+      lines,
+    });
+
+    await pool.query(
+      "UPDATE fixed_assets SET acquisition_cost = ?, acquisition_date = ?, opening_accumulated_depreciation = 0 WHERE id = ?",
+      [newValueNum, revaluationDate, asset.id]
+    );
+
+    await pool.query(
+      `INSERT INTO fixed_asset_revaluations (
+         fixed_asset_id, revaluation_date, previous_acquisition_cost, previous_book_value, new_value,
+         adjustment_amount, adjustment_account_id, journal_entry_id, notes, created_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        asset.id,
+        revaluationDate,
+        asset.acquisitionCost,
+        dep.bookValue,
+        newValueNum,
+        adjustment,
+        Number(adjustmentAccountId),
+        journalEntryId,
+        notes || null,
+        req.authUser!.id,
+      ]
+    );
+
+    res.status(201).json({ journalEntryId, previousBookValue: dep.bookValue, newValue: newValueNum, adjustment });
+  },
+
+  async revaluations(req: Request, res: Response) {
+    const [assetRows] = await pool.query("SELECT business_unit FROM fixed_assets WHERE id = ?", [req.params.id]);
+    const asset = (assetRows as any[])[0];
+    if (!asset || asset.business_unit !== req.businessUnit) throw new ApiError(404, "Aset tidak ditemukan");
+
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS created_by_name, a.code AS adjustment_account_code, a.name AS adjustment_account_name
+       FROM fixed_asset_revaluations r
+       LEFT JOIN users u ON u.id = r.created_by
+       JOIN accounts a ON a.id = r.adjustment_account_id
+       WHERE r.fixed_asset_id = ? ORDER BY r.revaluation_date DESC, r.id DESC`,
+      [req.params.id]
+    );
+
+    res.json(
+      (rows as any[]).map((r) => ({
+        id: r.id,
+        revaluationDate: r.revaluation_date,
+        previousAcquisitionCost: Number(r.previous_acquisition_cost),
+        previousBookValue: Number(r.previous_book_value),
+        newValue: Number(r.new_value),
+        adjustmentAmount: Number(r.adjustment_amount),
+        adjustmentAccountCode: r.adjustment_account_code,
+        adjustmentAccountName: r.adjustment_account_name,
+        journalEntryId: r.journal_entry_id,
+        notes: r.notes,
+        createdByName: r.created_by_name,
+        createdAt: r.created_at,
+      }))
+    );
   },
 };

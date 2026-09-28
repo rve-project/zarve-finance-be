@@ -28,7 +28,7 @@ async function loadDevUser(): Promise<PublicUser> {
   if (cachedDevUser) return cachedDevUser;
   const email = process.env.DEV_USER_EMAIL;
   const [rows] = await pool.query(
-    `SELECT id, email, name, zarve_user_id AS zarveUserId, role, aktif
+    `SELECT id, email, name, zarve_user_id AS zarveUserId, role, aktif, can_view_activity_log AS canViewActivityLog
      FROM users WHERE aktif = TRUE ${email ? "AND email = ?" : ""} ORDER BY id LIMIT 1`,
     email ? [email] : []
   );

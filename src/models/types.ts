@@ -178,6 +178,7 @@ export interface User {
   zarveUserId: string | null;
   role: UserRole;
   aktif: boolean;
+  canViewActivityLog: boolean;
 }
 
 export type PublicUser = Omit<User, "passwordHash">;

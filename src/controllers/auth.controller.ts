@@ -30,7 +30,8 @@ function toPublicUser(user: User): PublicUser {
   return rest;
 }
 
-const USER_COLUMNS = "id, email, name, password_hash AS passwordHash, zarve_user_id AS zarveUserId, role, aktif";
+const USER_COLUMNS =
+  "id, email, name, password_hash AS passwordHash, zarve_user_id AS zarveUserId, role, aktif, can_view_activity_log AS canViewActivityLog";
 
 async function findUserByEmail(email: string): Promise<User | undefined> {
   const [rows] = await pool.query(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`, [email]);

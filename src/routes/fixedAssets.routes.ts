@@ -12,3 +12,5 @@ fixedAssetsRouter.get("/disposed", fixedAssetsController.disposed);
 fixedAssetsRouter.get("/depreciation-schedule", fixedAssetsController.depreciationSchedule);
 fixedAssetsRouter.post("/", fixedAssetsController.create);
 fixedAssetsRouter.post("/:id/dispose", fixedAssetsController.dispose);
+fixedAssetsRouter.post("/:id/revalue", fixedAssetsController.revalue);
+fixedAssetsRouter.get("/:id/revaluations", fixedAssetsController.revaluations);

@@ -7,6 +7,7 @@ import { env } from "./config/env";
 import { apiRouter } from "./routes";
 import { errorHandler, notFoundHandler } from "./middlewares/errorHandler";
 import { resolveBusinessUnit } from "./middlewares/businessUnit";
+import { auditLog } from "./middlewares/auditLog";
 
 export function createApp() {
   const app = express();
@@ -21,6 +22,7 @@ export function createApp() {
   app.use(express.json());
   app.use(morgan(env.nodeEnv === "development" ? "dev" : "combined"));
   app.use(resolveBusinessUnit);
+  app.use(auditLog);
 
   app.use("/api", apiRouter);
 

@@ -12,6 +12,7 @@ function mapRow(row: any): ManagedUser {
     name: row.name,
     role: row.role,
     aktif: Boolean(row.aktif),
+    canViewActivityLog: Boolean(row.can_view_activity_log),
     zarveUserId: row.zarve_user_id,
     createdAt: row.created_at,
   };
@@ -55,15 +56,16 @@ export const usersController = {
     const current = await findRow(req.params.id);
     if (!current) throw new ApiError(404, "User tidak ditemukan");
 
-    const { name, aktif } = req.body;
+    const { name, aktif, canViewActivityLog } = req.body;
     if (aktif === false && current.aktif) {
       if (current.id === req.authUser!.id) throw new ApiError(400, "Tidak bisa menonaktifkan akun sendiri");
       if ((await countOtherActiveUsers(current.id)) === 0) throw new ApiError(400, "Minimal harus ada satu user aktif");
     }
 
-    await pool.query("UPDATE users SET name = ?, aktif = ? WHERE id = ?", [
+    await pool.query("UPDATE users SET name = ?, aktif = ?, can_view_activity_log = ? WHERE id = ?", [
       typeof name === "string" && name.trim() ? name.trim() : current.name,
       typeof aktif === "boolean" ? aktif : Boolean(current.aktif),
+      typeof canViewActivityLog === "boolean" ? canViewActivityLog : Boolean(current.can_view_activity_log),
       current.id,
     ]);
     res.json(mapRow(await findRow(current.id)));

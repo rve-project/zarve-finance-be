@@ -3,8 +3,13 @@ import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { getAccountBalances, getGeneralLedgerLines } from "../utils/reportEngine";
 import { toUtcIso } from "../utils/zarveMirror";
+import { getAccountIdByCode, WELL_KNOWN_ACCOUNTS } from "../utils/ledger";
 
 const EPOCH = "1970-01-01";
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
 
 function requireDateRange(req: Request): { from: string; to: string } {
   const from = (req.query.from as string) || EPOCH;
@@ -348,5 +353,152 @@ export const reportsController = {
         invoiceNumber: r.invoice_number,
       })),
     });
+  },
+
+  /**
+   * D'Consulting audit gaps #6/#7: a runnable "trial test" the team can check any time,
+   * covering both Zarve and B2B, manual and Zarve-synced transactions -- not a one-off
+   * migration script.
+   *
+   *  1. Orphan check: every transaction table that should post a journal entry, but
+   *     doesn't have one. Structurally this should never happen (every create path posts
+   *     its journal entry in the same DB transaction) -- this is the safety net that
+   *     actually proves it, instead of just trusting the code.
+   *  2. Trial balance check: per business unit, total debit must equal total credit.
+   *  3. Subledger vs GL check: AR/AP per subledger (unpaid invoices/bills) vs the
+   *     corresponding GL account balance.
+   */
+  async journalValidation(_req: Request, res: Response) {
+    const orphanChecks: { label: string; businessUnit: "zarve" | "b2b" | null; sql: string }[] = [
+      {
+        label: "invoices",
+        businessUnit: "zarve",
+        sql: `SELECT i.id, i.number AS ref FROM invoices i
+              LEFT JOIN journal_entries je ON je.source_type = 'invoice' AND je.source_id = i.id
+              WHERE je.id IS NULL`,
+      },
+      {
+        label: "payments",
+        businessUnit: "zarve",
+        sql: `SELECT p.id, CONCAT('PAY-', p.id) AS ref FROM payments p
+              LEFT JOIN journal_entries je ON je.source_type = 'payment' AND je.source_id = p.id
+              WHERE je.id IS NULL`,
+      },
+      {
+        label: "vendor_bills",
+        businessUnit: "zarve",
+        sql: `SELECT vb.id, vb.number AS ref FROM vendor_bills vb
+              LEFT JOIN journal_entries je ON je.source_type = 'vendor_bill' AND je.source_id = vb.id
+              WHERE je.id IS NULL`,
+      },
+      {
+        label: "vendor_payments",
+        businessUnit: "zarve",
+        sql: `SELECT vp.id, CONCAT('VPAY-', vp.id) AS ref FROM vendor_payments vp
+              LEFT JOIN journal_entries je ON je.source_type = 'vendor_payment' AND je.source_id = vp.id
+              WHERE je.id IS NULL`,
+      },
+      {
+        label: "fixed_assets",
+        businessUnit: null,
+        sql: `SELECT fa.id, fa.asset_number AS ref FROM fixed_assets fa WHERE fa.purchase_journal_entry_id IS NULL`,
+      },
+      {
+        label: "expenses",
+        businessUnit: null,
+        sql: `SELECT e.id, e.number AS ref FROM expenses e
+              LEFT JOIN journal_entries je ON je.source_type = 'expense' AND je.source_id = e.id
+              WHERE je.id IS NULL`,
+      },
+      {
+        label: "sale_invoices",
+        businessUnit: null,
+        sql: `SELECT sd.id, sd.number AS ref FROM sale_documents sd
+              LEFT JOIN journal_entries je ON je.source_type = 'sale_invoice' AND je.source_id = sd.id
+              WHERE sd.doc_type = 'invoice' AND sd.status = 'approved' AND je.id IS NULL`,
+      },
+      {
+        label: "purchase_invoices",
+        businessUnit: null,
+        sql: `SELECT pd.id, pd.number AS ref FROM purchase_documents pd
+              LEFT JOIN journal_entries je ON je.source_type = 'purchase_invoice' AND je.source_id = pd.id
+              WHERE pd.doc_type = 'invoice' AND pd.status = 'approved' AND je.id IS NULL`,
+      },
+    ];
+
+    const orphanTransactions: { type: string; id: number; ref: string | null }[] = [];
+    for (const check of orphanChecks) {
+      const [rows] = await pool.query(check.sql);
+      for (const r of rows as any[]) {
+        orphanTransactions.push({ type: check.label, id: r.id, ref: r.ref });
+      }
+    }
+
+    const [balanceRows] = await pool.query(
+      `SELECT je.business_unit, COALESCE(SUM(jl.debit), 0) AS total_debit, COALESCE(SUM(jl.credit), 0) AS total_credit
+       FROM journal_entries je JOIN journal_lines jl ON jl.journal_entry_id = je.id
+       GROUP BY je.business_unit`
+    );
+    const trialBalance = (balanceRows as any[]).map((r) => ({
+      businessUnit: r.business_unit,
+      totalDebit: round2(Number(r.total_debit)),
+      totalCredit: round2(Number(r.total_credit)),
+      balanced: round2(Number(r.total_debit)) === round2(Number(r.total_credit)),
+    }));
+
+    const subledgerMismatches: { label: string; subledgerTotal: number; glTotal: number; difference: number }[] = [];
+
+    // Zarve AR: one well-known account for every partner.
+    {
+      const [rows] = await pool.query(
+        `SELECT COALESCE(SUM(i.total_amount), 0) - COALESCE((SELECT SUM(amount) FROM payments), 0) AS outstanding FROM invoices i`
+      );
+      const subledgerTotal = round2(Number((rows as any[])[0].outstanding));
+      const arAccountId = await getAccountIdByCode(WELL_KNOWN_ACCOUNTS.ACCOUNTS_RECEIVABLE, "zarve");
+      const [glRows] = await pool.query(
+        `SELECT COALESCE(SUM(jl.debit), 0) - COALESCE(SUM(jl.credit), 0) AS balance FROM journal_lines jl WHERE jl.account_id = ?`,
+        [arAccountId]
+      );
+      const glTotal = round2(Number((glRows as any[])[0].balance));
+      const difference = round2(subledgerTotal - glTotal);
+      if (Math.abs(difference) > 0.01) subledgerMismatches.push({ label: "Piutang Usaha (Zarve)", subledgerTotal, glTotal, difference });
+    }
+
+    // B2B AR/AP: contacts can override the account per-contact, so the GL side sums
+    // every distinct receivable/payable account actually in use, not just the default.
+    async function b2bSubledgerVsGl(
+      docTable: "sale_documents" | "purchase_documents",
+      paymentTable: "sale_payments" | "purchase_payments",
+      contactAccountColumn: "receivable_account_id" | "payable_account_id",
+      defaultAccountCode: string,
+      label: string
+    ) {
+      const [rows] = await pool.query(
+        `SELECT COALESCE(SUM(x.outstanding), 0) AS outstanding FROM (
+           SELECT d.total_amount - COALESCE((SELECT SUM(amount) FROM ${paymentTable} WHERE document_id = d.id), 0) AS outstanding
+           FROM ${docTable} d WHERE d.business_unit = 'b2b' AND d.doc_type = 'invoice' AND d.status = 'approved'
+         ) x`
+      );
+      const subledgerTotal = round2(Number((rows as any[])[0]?.outstanding ?? 0));
+
+      const defaultAccountId = await getAccountIdByCode(defaultAccountCode, "b2b");
+      const [accountRows] = await pool.query(
+        `SELECT DISTINCT ${contactAccountColumn} AS account_id FROM contacts WHERE business_unit = 'b2b' AND ${contactAccountColumn} IS NOT NULL`
+      );
+      const accountIds = Array.from(new Set([defaultAccountId, ...(accountRows as any[]).map((r) => r.account_id)]));
+
+      const [glRows] = await pool.query(
+        `SELECT COALESCE(SUM(jl.debit), 0) - COALESCE(SUM(jl.credit), 0) AS balance FROM journal_lines jl WHERE jl.account_id IN (?)`,
+        [accountIds]
+      );
+      const glTotal = round2(Number((glRows as any[])[0].balance));
+      const difference = round2(subledgerTotal - glTotal);
+      if (Math.abs(difference) > 0.01) subledgerMismatches.push({ label, subledgerTotal, glTotal, difference });
+    }
+
+    await b2bSubledgerVsGl("sale_documents", "sale_payments", "receivable_account_id", "1-10100", "Piutang Usaha (B2B)");
+    await b2bSubledgerVsGl("purchase_documents", "purchase_payments", "payable_account_id", "2-20100", "Utang Usaha (B2B)");
+
+    res.json({ orphanTransactions, trialBalance, subledgerMismatches });
   },
 };
