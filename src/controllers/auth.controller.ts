@@ -4,6 +4,7 @@ import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { PublicUser, User } from "../models/types";
 import { zarveLogin, zarveGoogleLogin, setZarveApiToken, ZarveLoginUser } from "../utils/zarveApiClient";
+import { verifyPassword } from "../utils/password";
 
 interface Session {
   userId: number;
@@ -31,7 +32,7 @@ function toPublicUser(user: User): PublicUser {
 }
 
 const USER_COLUMNS =
-  "id, email, name, password_hash AS passwordHash, zarve_user_id AS zarveUserId, role, aktif, can_view_activity_log AS canViewActivityLog";
+  "id, email, name, password_hash AS passwordHash, zarve_user_id AS zarveUserId, role, aktif, can_view_activity_log AS canViewActivityLog, allowed_modules AS allowedModules";
 
 async function findUserByEmail(email: string): Promise<User | undefined> {
   const [rows] = await pool.query(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`, [email]);
@@ -99,12 +100,26 @@ async function completeZarveLogin(res: Response, registered: User, zu: ZarveLogi
 }
 
 export const authController = {
-  // Every login goes through Zarve's own account system -- no local password.
+  // Two account types share this one endpoint: a Zarve-linked user (the original
+  // design -- no local password, every login delegates to Zarve) and a local-only user
+  // (for people with no reason to have a Zarve account, e.g. an external accountant).
+  // The signal is simply whether an admin ever set a local password for this email: if
+  // `passwordHash` is set, it's checked directly and Zarve is never contacted for this
+  // login; if it's NULL, behavior is exactly what it always was.
   async login(req: Request, res: Response) {
     const { email, password } = req.body;
     if (!email || !password) throw new ApiError(400, "Email dan password wajib diisi");
 
     const registered = await requireRegistered(String(email));
+
+    if (registered.passwordHash) {
+      if (!verifyPassword(String(password), registered.passwordHash)) {
+        throw new ApiError(401, "Email atau password salah");
+      }
+      issueSession(res, registered);
+      return;
+    }
+
     const result = await zarveLogin(String(email).trim(), String(password));
     if (!result) throw new ApiError(401, "Email atau password salah");
     await completeZarveLogin(res, registered, result.user, result.token);

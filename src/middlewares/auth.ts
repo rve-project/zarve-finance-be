@@ -4,6 +4,7 @@ import { resolveSession, findUserById } from "../controllers/auth.controller";
 import { env } from "../config/env";
 import { pool } from "../db";
 import { PublicUser } from "../models/types";
+import { ModuleKey } from "../config/modules";
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -28,7 +29,8 @@ async function loadDevUser(): Promise<PublicUser> {
   if (cachedDevUser) return cachedDevUser;
   const email = process.env.DEV_USER_EMAIL;
   const [rows] = await pool.query(
-    `SELECT id, email, name, zarve_user_id AS zarveUserId, role, aktif, can_view_activity_log AS canViewActivityLog
+    `SELECT id, email, name, zarve_user_id AS zarveUserId, role, aktif, can_view_activity_log AS canViewActivityLog,
+       allowed_modules AS allowedModules
      FROM users WHERE aktif = TRUE ${email ? "AND email = ?" : ""} ORDER BY id LIMIT 1`,
     email ? [email] : []
   );
@@ -56,4 +58,15 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
   const { passwordHash: _passwordHash, ...publicUser } = user;
   req.authUser = publicUser;
   next();
+}
+
+/** Gates a route by sidebar module, honoring a user's `allowedModules` restriction. */
+export function requireModule(module: ModuleKey) {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    const allowed = req.authUser?.allowedModules;
+    if (allowed && !allowed.includes(module)) {
+      throw new ApiError(403, "Anda tidak memiliki akses ke menu ini");
+    }
+    next();
+  };
 }

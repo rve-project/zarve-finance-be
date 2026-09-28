@@ -179,11 +179,15 @@ export interface User {
   role: UserRole;
   aktif: boolean;
   canViewActivityLog: boolean;
+  /** Per-user menu restriction. Null/undefined = full access (default). */
+  allowedModules: string[] | null;
 }
 
 export type PublicUser = Omit<User, "passwordHash">;
 
 export interface ManagedUser extends PublicUser {
+  /** Whether an admin set a local password for this account (login skips Zarve entirely when true). */
+  hasLocalPassword: boolean;
   createdAt: string;
 }
 

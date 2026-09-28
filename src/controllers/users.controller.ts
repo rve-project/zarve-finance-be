@@ -2,6 +2,8 @@ import { Request, Response } from "express";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { ManagedUser } from "../models/types";
+import { hashPassword } from "../utils/password";
+import { MODULE_KEYS } from "../config/modules";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -14,8 +16,21 @@ function mapRow(row: any): ManagedUser {
     aktif: Boolean(row.aktif),
     canViewActivityLog: Boolean(row.can_view_activity_log),
     zarveUserId: row.zarve_user_id,
+    allowedModules: row.allowed_modules ?? null,
+    hasLocalPassword: Boolean(row.password_hash),
     createdAt: row.created_at,
   };
+}
+
+function parseAllowedModules(value: unknown): string[] | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!Array.isArray(value)) throw new ApiError(400, "allowedModules harus berupa array");
+  const strings = value.map((v) => String(v));
+  const validKeys: readonly string[] = MODULE_KEYS;
+  const invalid = strings.filter((v) => !validKeys.includes(v));
+  if (invalid.length > 0) throw new ApiError(400, `Modul tidak valid: ${invalid.join(", ")}`);
+  return Array.from(new Set(strings));
 }
 
 async function findRow(id: unknown) {
@@ -44,10 +59,20 @@ export const usersController = {
     const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
     if ((existing as any[])[0]) throw new ApiError(409, "Email sudah terdaftar");
 
-    // Name is optional -- it gets refreshed from the Zarve account on first login.
+    // Password is optional: leave it out for a Zarve-linked account (the original
+    // design -- this email must also be a valid Zarve account, and Zarve verifies the
+    // password on every login). Set one to create a fully local account instead, for
+    // someone with no Zarve account at all -- login() checks it directly, no Zarve
+    // dependency.
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const passwordHash = password ? hashPassword(password) : null;
+    const allowedModules = parseAllowedModules(req.body.allowedModules) ?? null;
+
+    // Name is optional -- it gets refreshed from the Zarve account on first login (for
+    // Zarve-linked accounts only; a local account keeps whatever name was set here).
     const [result] = await pool.query(
-      "INSERT INTO users (email, name, password_hash, role, aktif) VALUES (?, ?, NULL, 'admin', TRUE)",
-      [email, name || email.split("@")[0]]
+      "INSERT INTO users (email, name, password_hash, role, aktif, allowed_modules) VALUES (?, ?, ?, 'admin', TRUE, ?)",
+      [email, name || email.split("@")[0], passwordHash, allowedModules ? JSON.stringify(allowedModules) : null]
     );
     res.status(201).json(mapRow(await findRow((result as any).insertId)));
   },
@@ -56,18 +81,34 @@ export const usersController = {
     const current = await findRow(req.params.id);
     if (!current) throw new ApiError(404, "User tidak ditemukan");
 
-    const { name, aktif, canViewActivityLog } = req.body;
+    const { name, aktif, canViewActivityLog, password } = req.body;
     if (aktif === false && current.aktif) {
       if (current.id === req.authUser!.id) throw new ApiError(400, "Tidak bisa menonaktifkan akun sendiri");
       if ((await countOtherActiveUsers(current.id)) === 0) throw new ApiError(400, "Minimal harus ada satu user aktif");
     }
 
-    await pool.query("UPDATE users SET name = ?, aktif = ?, can_view_activity_log = ? WHERE id = ?", [
-      typeof name === "string" && name.trim() ? name.trim() : current.name,
-      typeof aktif === "boolean" ? aktif : Boolean(current.aktif),
-      typeof canViewActivityLog === "boolean" ? canViewActivityLog : Boolean(current.can_view_activity_log),
-      current.id,
-    ]);
+    const allowedModules = parseAllowedModules(req.body.allowedModules);
+    const passwordHash = typeof password === "string" && password ? hashPassword(password) : undefined;
+
+    await pool.query(
+      `UPDATE users SET name = ?, aktif = ?, can_view_activity_log = ?, allowed_modules = ?
+       ${passwordHash !== undefined ? ", password_hash = ?" : ""}
+       WHERE id = ?`,
+      [
+        typeof name === "string" && name.trim() ? name.trim() : current.name,
+        typeof aktif === "boolean" ? aktif : Boolean(current.aktif),
+        typeof canViewActivityLog === "boolean" ? canViewActivityLog : Boolean(current.can_view_activity_log),
+        allowedModules === undefined
+          ? current.allowed_modules
+            ? JSON.stringify(current.allowed_modules)
+            : null
+          : allowedModules === null
+            ? null
+            : JSON.stringify(allowedModules),
+        ...(passwordHash !== undefined ? [passwordHash] : []),
+        current.id,
+      ]
+    );
     res.json(mapRow(await findRow(current.id)));
   },
 

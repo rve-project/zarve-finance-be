@@ -1,0 +1,11 @@
+-- Two independent additions to `users`:
+-- 1) Per-user menu restriction (same pattern as bengkel's system): NULL = full access
+--    (default, backward compatible with every existing user), a JSON array = an
+--    explicit allow-list of sidebar sections. Enforced in the frontend Sidebar/route
+--    guard everywhere, and on the backend for the one route that matters most to lock
+--    down (managing users themselves) -- see requireModule in middlewares/auth.ts.
+-- 2) `password_hash` already existed but was never checked anywhere: login() only ever
+--    delegated to Zarve's own account system. Nothing to add here -- login() now checks
+--    a user's local password first (if an admin set one) and only falls through to
+--    Zarve when it's NULL, so this migration is purely the allowed_modules column.
+ALTER TABLE users ADD COLUMN allowed_modules JSON NULL;
