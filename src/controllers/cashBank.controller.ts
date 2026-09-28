@@ -171,6 +171,7 @@ export const cashBankController = {
              ELSE NULL
            END AS doc_kind,
            COALESCE(pd.id, pd2.id, sd.id, sd2.id, ex.id) AS doc_id,
+           jl.reconciled_at,
            SUM(jl.debit - jl.credit) OVER (ORDER BY je.date, jl.id) AS running_balance
          ${baseQuery}
        ) t
@@ -200,6 +201,140 @@ export const cashBankController = {
         debit: Number(r.debit),
         credit: Number(r.credit),
         runningBalance: Number(r.running_balance),
+        reconciledAt: r.reconciled_at,
+      })),
+    });
+  },
+
+  /**
+   * D'Consulting audit gap #8 for B2B: tick-and-go bank reconciliation (see migration
+   * 050_cash_bank_reconciliation.sql). Unlike Zarve's reconciliation (which sweeps
+   * "Undeposited Funds" into a real bank account via a new journal entry), B2B lines
+   * already sit on their final bank/cash account -- reconciling here is purely a status
+   * stamp on existing journal_lines, no money movement, no new journal entry.
+   */
+  async unreconciledLines(req: Request, res: Response) {
+    const accountId = Number(req.params.accountId);
+    const [accountRows] = await pool.query("SELECT * FROM accounts WHERE id = ?", [accountId]);
+    const account = (accountRows as any[])[0];
+    if (!account || account.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
+
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(jl.debit - jl.credit), 0) AS total
+       FROM journal_lines jl JOIN journal_entries je ON je.id = jl.journal_entry_id
+       WHERE jl.account_id = ? AND jl.reconciliation_batch_id IS NULL`,
+      [accountId]
+    );
+    const total = (countRows as any[])[0].cnt as number;
+    const totalAmount = Number((countRows as any[])[0].total);
+
+    const [rows] = await pool.query(
+      `SELECT jl.id AS line_id, je.date, je.ref, je.narration, je.source_type, jl.debit, jl.credit, jl.description AS line_description
+       FROM journal_lines jl JOIN journal_entries je ON je.id = jl.journal_entry_id
+       WHERE jl.account_id = ? AND jl.reconciliation_batch_id IS NULL
+       ORDER BY je.date, jl.id
+       LIMIT ? OFFSET ?`,
+      [accountId, limit, (page - 1) * limit]
+    );
+
+    res.json({
+      total,
+      totalAmount,
+      page,
+      limit,
+      data: (rows as any[]).map((r) => ({
+        lineId: r.line_id,
+        date: r.date,
+        ref: r.ref,
+        narration: r.narration,
+        sourceType: r.source_type,
+        lineDescription: r.line_description,
+        amount: Number(r.debit) - Number(r.credit),
+      })),
+    });
+  },
+
+  async reconcile(req: Request, res: Response) {
+    const accountId = Number(req.params.accountId);
+    const { lineIds, all, date } = req.body;
+    if (!date) throw new ApiError(400, "date wajib diisi");
+    if (!all && (!Array.isArray(lineIds) || !lineIds.length)) {
+      throw new ApiError(400, "lineIds wajib diisi (atau kirim all: true untuk rekonsiliasi semua)");
+    }
+
+    const [accountRows] = await pool.query("SELECT * FROM accounts WHERE id = ?", [accountId]);
+    const account = (accountRows as any[])[0];
+    if (!account || account.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      const [rows] = await conn.query(
+        `SELECT jl.id, jl.debit, jl.credit FROM journal_lines jl
+         WHERE jl.account_id = ? AND jl.reconciliation_batch_id IS NULL ${all ? "" : "AND jl.id IN (?)"} FOR UPDATE`,
+        all ? [accountId] : [accountId, lineIds]
+      );
+      const selected = rows as { id: number; debit: string | number; credit: string | number }[];
+      if (!selected.length) throw new ApiError(400, "Tidak ada baris yang bisa direkonsiliasi (mungkin sudah direkonsiliasi lebih dulu).");
+
+      const totalAmount = selected.reduce((sum, r) => sum + (Number(r.debit) - Number(r.credit)), 0);
+
+      const [batchResult] = await conn.query(
+        "INSERT INTO cash_bank_reconciliations (business_unit, account_id, reconciliation_date, total_amount, line_count, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+        [req.businessUnit, accountId, date, totalAmount, selected.length, req.authUser!.id]
+      );
+      const batchId = (batchResult as any).insertId;
+
+      await conn.query("UPDATE journal_lines SET reconciled_at = ?, reconciliation_batch_id = ? WHERE id IN (?)", [
+        date,
+        batchId,
+        selected.map((r) => r.id),
+      ]);
+
+      await conn.commit();
+      res.status(201).json({ batchId, totalAmount, lineCount: selected.length });
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  },
+
+  async reconciliationHistory(req: Request, res: Response) {
+    const accountId = Number(req.params.accountId);
+    const [accountRows] = await pool.query("SELECT * FROM accounts WHERE id = ?", [accountId]);
+    const account = (accountRows as any[])[0];
+    if (!account || account.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
+
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const limit = req.query.limit ? Number(req.query.limit) : 20;
+
+    const [countRows] = await pool.query("SELECT COUNT(*) AS cnt FROM cash_bank_reconciliations WHERE account_id = ?", [accountId]);
+    const total = (countRows as any[])[0].cnt as number;
+
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS created_by_name FROM cash_bank_reconciliations r
+       LEFT JOIN users u ON u.id = r.created_by
+       WHERE r.account_id = ? ORDER BY r.reconciliation_date DESC, r.id DESC LIMIT ? OFFSET ?`,
+      [accountId, limit, (page - 1) * limit]
+    );
+
+    res.json({
+      total,
+      page,
+      limit,
+      data: (rows as any[]).map((r) => ({
+        id: r.id,
+        reconciliationDate: r.reconciliation_date,
+        totalAmount: Number(r.total_amount),
+        lineCount: r.line_count,
+        createdByName: r.created_by_name,
+        createdAt: r.created_at,
       })),
     });
   },

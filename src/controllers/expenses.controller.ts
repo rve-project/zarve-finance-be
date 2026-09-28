@@ -19,6 +19,24 @@ const B2B_ACCOUNTS = {
   DISKON_PEMBELIAN: "5-50100", // Diskon Pembelian -- discount received reduces COGS
 };
 
+/**
+ * Editing/deleting an expense deletes its old journal entry outright (see
+ * updateExpense/deleteExpense below) -- if any of that entry's lines were already ticked
+ * off in bank reconciliation (cash_bank_reconciliations, migration
+ * 050_cash_bank_reconciliation.sql), silently deleting them would desync the
+ * reconciliation batch's stored total/count from what the ledger actually shows, with no
+ * trace it happened. Block it instead; the user has to unreconcile (not yet a feature --
+ * today that means asking whoever reconciled it) before editing/deleting.
+ */
+async function assertJournalNotReconciled(conn: PoolConnection, journalEntryId: number) {
+  const [rows] = await conn.query("SELECT COUNT(*) AS cnt FROM journal_lines WHERE journal_entry_id = ? AND reconciliation_batch_id IS NOT NULL", [
+    journalEntryId,
+  ]);
+  if ((rows as any[])[0].cnt > 0) {
+    throw new ApiError(400, "Biaya ini sudah direkonsiliasi di Kas & Bank dan tidak bisa diubah/dihapus lagi.");
+  }
+}
+
 function mapRow(row: any) {
   return {
     id: row.id,
@@ -221,6 +239,7 @@ export async function updateExpense(businessUnit: "zarve" | "b2b", id: number, i
     );
     const oldJournalId = (oldJournalRows as any[])[0]?.id;
     if (oldJournalId) {
+      await assertJournalNotReconciled(conn, oldJournalId);
       await conn.query("DELETE FROM journal_lines WHERE journal_entry_id = ?", [oldJournalId]);
       await conn.query("DELETE FROM journal_entries WHERE id = ?", [oldJournalId]);
     }
@@ -290,6 +309,7 @@ export async function deleteExpense(businessUnit: "zarve" | "b2b", id: number) {
     );
     const journalId = (journalRows as any[])[0]?.id;
     if (journalId) {
+      await assertJournalNotReconciled(conn, journalId);
       await conn.query("DELETE FROM journal_lines WHERE journal_entry_id = ?", [journalId]);
       await conn.query("DELETE FROM journal_entries WHERE id = ?", [journalId]);
     }

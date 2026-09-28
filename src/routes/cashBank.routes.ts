@@ -13,3 +13,6 @@ cashBankRouter.get("/accounts/:accountId/ledger", cashBankController.ledger);
 cashBankRouter.get("/summary", cashBankController.summary);
 cashBankRouter.get("/import-template", cashBankController.downloadTemplate);
 cashBankRouter.post("/accounts/:accountId/import", upload.single("file"), cashBankController.importStatement);
+cashBankRouter.get("/accounts/:accountId/unreconciled", cashBankController.unreconciledLines);
+cashBankRouter.post("/accounts/:accountId/reconcile", cashBankController.reconcile);
+cashBankRouter.get("/accounts/:accountId/reconciliation-history", cashBankController.reconciliationHistory);
