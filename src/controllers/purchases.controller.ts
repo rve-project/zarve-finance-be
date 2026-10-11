@@ -2,7 +2,7 @@ import { Request, Response } from "express";
 import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
-import { postJournalEntry, getAccountIdByCode } from "../utils/ledger";
+import { postJournalEntry, getAccountIdByCode, resolveTaxJournalLines } from "../utils/ledger";
 import { adjustWarehouseStock } from "../utils/warehouseStock";
 
 /**
@@ -142,6 +142,9 @@ export interface PurchaseLineInput {
 }
 
 export interface PurchaseDocInput {
+  /** Create-only override -- when omitted, falls back to the auto sequence. Updates
+   * never touch the number, matching every other document type in this app. */
+  number?: string | null;
   contactId?: number | null;
   documentDate: string;
   dueDate?: string | null;
@@ -213,17 +216,18 @@ async function resolveLineAccounts(lines: PurchaseLineInput[]): Promise<Resolved
   });
 }
 
-/** Posts the invoice's journal entry: debit each line's resolved account, debit PPN
- * Masukan for the tax total, credit Diskon Pembelian for any discount, credit the
- * supplier's mapped Akun Hutang (or the generic default) for the net total. */
+/** Posts the invoice's journal entry: debit each line's resolved account, debit each
+ * tax's own mapped account (or PPN Masukan as the default) for its share of the tax
+ * total, credit Diskon Pembelian for any discount, credit the supplier's mapped Akun
+ * Hutang (or the generic default) for the net total. */
 async function postInvoiceJournal(
   businessUnit: "zarve" | "b2b",
   doc: { id: number; number: string; documentDate: string; contactId: number | null; taxTotal: number; totalAmount: number; discountAmount: number },
   resolvedLines: ResolvedLine[],
+  taxLines: { accountId: number; amount: number; sign: 1 | -1 }[],
   conn: PoolConnection
 ) {
   const payableAccountId = await resolvePayableAccountId(businessUnit, doc.contactId);
-  const ppnMasukanId = doc.taxTotal > 0 ? await getAccountIdByCode(B2B_ACCOUNTS.PPN_MASUKAN, businessUnit) : null;
   const diskonPembelianId =
     doc.discountAmount > 0 ? await getAccountIdByCode(B2B_ACCOUNTS.DISKON_PEMBELIAN, businessUnit) : null;
 
@@ -237,7 +241,10 @@ async function postInvoiceJournal(
       businessUnit,
       lines: [
         ...resolvedLines.filter((l) => l.accountId).map((l) => ({ accountId: l.accountId!, debit: l.amount, credit: 0 })),
-        ...(ppnMasukanId && doc.taxTotal > 0 ? [{ accountId: ppnMasukanId, debit: doc.taxTotal, credit: 0 }] : []),
+        // sign 1 (e.g. PPN Masukan) debits as usual (an asset); sign -1 (e.g. a
+        // withheld PPh 23 component of a compound tax) credits instead, to its own
+        // payable account -- see resolveTaxJournalLines in utils/ledger.ts.
+        ...taxLines.map((t) => (t.sign === 1 ? { accountId: t.accountId, debit: t.amount, credit: 0 } : { accountId: t.accountId, debit: 0, credit: t.amount })),
         ...(diskonPembelianId && doc.discountAmount > 0
           ? [{ accountId: diskonPembelianId, debit: 0, credit: doc.discountAmount }]
           : []),
@@ -366,7 +373,11 @@ export const purchasesController = {
     if (!DOC_TYPES.includes(docType)) throw new ApiError(400, "Tipe dokumen tidak valid");
 
     const totals = computeTotals(input.lines, input.discountAmount);
-    const number = await nextNumber(req.businessUnit, docType, input.documentDate);
+    if (input.number) {
+      const [dupRows] = await pool.query("SELECT id FROM purchase_documents WHERE business_unit = ? AND number = ?", [req.businessUnit, input.number]);
+      if ((dupRows as any[]).length) throw new ApiError(400, `Nomor dokumen "${input.number}" sudah dipakai`);
+    }
+    const number = input.number || (await nextNumber(req.businessUnit, docType, input.documentDate));
     const status: PurchaseStatus = input.submitForApproval ? "pending_approval" : "draft";
 
     const [result] = await pool.query(
@@ -508,7 +519,7 @@ export const purchasesController = {
 
       if (doc.doc_type === "invoice") {
         const [lineRows] = await conn.query(
-          "SELECT product_id, account_id, qty, amount, tax_amount FROM purchase_document_lines WHERE document_id = ?",
+          "SELECT product_id, account_id, qty, amount, tax_id, tax_amount FROM purchase_document_lines WHERE document_id = ?",
           [id]
         );
         const rawLines = (lineRows as any[]).map((l) => ({
@@ -516,10 +527,12 @@ export const purchasesController = {
           accountId: l.account_id,
           qty: Number(l.qty),
           amount: Number(l.amount),
+          taxId: l.tax_id,
           taxAmount: Number(l.tax_amount),
           unitPrice: 0,
         }));
         const resolvedLines = await resolveLineAccounts(rawLines);
+        const taxLines = await resolveTaxJournalLines(rawLines, B2B_ACCOUNTS.PPN_MASUKAN, req.businessUnit);
         await postInvoiceJournal(
           req.businessUnit,
           {
@@ -532,6 +545,7 @@ export const purchasesController = {
             discountAmount: Number(doc.discount_amount ?? 0),
           },
           resolvedLines,
+          taxLines,
           conn
         );
 
@@ -637,7 +651,7 @@ export const purchasesController = {
 
   async addPayment(req: Request, res: Response) {
     const id = Number(req.params.id);
-    const [rows] = await pool.query("SELECT * FROM purchase_documents WHERE id = ?", [id]);
+    const [rows] = await pool.query(`SELECT pd.*,${PAID_AND_CREDITED_SQL} FROM purchase_documents pd WHERE pd.id = ?`, [id]);
     const doc = (rows as any[])[0];
     if (!doc || doc.business_unit !== req.businessUnit) throw new ApiError(404, "Dokumen pembelian tidak ditemukan");
     if (doc.doc_type !== "invoice" || doc.status !== "approved") {
@@ -646,6 +660,15 @@ export const purchasesController = {
 
     const { bankAccountId, amount, paymentDate, memo } = req.body;
     if (!bankAccountId || !amount || !paymentDate) throw new ApiError(400, "Akun bayar, jumlah, dan tanggal wajib diisi");
+
+    // Nothing else re-checks this on its own -- without it, recording a payment never
+    // stopped at the invoice's own total, so "Sisa Tagihan" could go (and stay) negative
+    // while the payment form kept accepting more payments on top.
+    const outstanding = round2(Number(doc.total_amount) - Number(doc.total_paid) - Number(doc.total_credited ?? 0));
+    if (outstanding <= 0) throw new ApiError(400, "Faktur ini sudah lunas, tidak ada sisa tagihan untuk dibayar");
+    if (Number(amount) > outstanding) {
+      throw new ApiError(400, `Jumlah pembayaran melebihi sisa tagihan (sisa: ${outstanding})`);
+    }
 
     const payableAccountId = await resolvePayableAccountId(req.businessUnit, doc.contact_id);
 
@@ -708,6 +731,7 @@ async function insertLines(documentId: number, lines: PurchaseLineInput[]) {
 
 function parsePurchaseInput(body: any): PurchaseDocInput {
   const {
+    number,
     contactId,
     documentDate,
     dueDate,
@@ -732,6 +756,7 @@ function parsePurchaseInput(body: any): PurchaseDocInput {
   if (!Array.isArray(lines) || !lines.length) throw new ApiError(400, "Minimal 1 baris wajib diisi");
 
   return {
+    number: number ? String(number).trim() || null : null,
     contactId: contactId ? Number(contactId) : null,
     documentDate,
     dueDate: dueDate || null,

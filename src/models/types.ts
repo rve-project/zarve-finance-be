@@ -39,11 +39,22 @@ export interface AccountCategory {
   isActive: boolean;
 }
 
+export interface TaxComponent {
+  taxId: number;
+  name: string;
+  rate: number;
+  sign: "add" | "subtract";
+}
+
 export interface TaxCode {
   id: number;
   businessUnit: BusinessUnit;
   name: string;
   rate: number;
+  accountId: number | null;
+  accountName: string | null;
+  isCompound: boolean;
+  components: TaxComponent[];
   isActive: boolean;
 }
 
@@ -53,6 +64,28 @@ export interface Bank {
   id: number;
   businessUnit: BusinessUnit;
   name: string;
+  isActive: boolean;
+}
+
+export interface PaymentTerm {
+  id: number;
+  businessUnit: BusinessUnit;
+  name: string;
+  /** Days after the document date the due date auto-fills to; NULL = "Custom" (left to
+   * the user to pick manually). */
+  days: number | null;
+  isActive: boolean;
+}
+
+/** "Jenis Aset" list for the fixed-asset create form -- editable via Settings, same
+ * pattern as PaymentTerm/Bank. */
+export interface FixedAssetType {
+  id: number;
+  businessUnit: BusinessUnit;
+  name: string;
+  /** Whether a plate number is mandatory for an asset of this type (e.g. "Kendaraan
+   * Operasional"). */
+  requiresPlateNumber: boolean;
   isActive: boolean;
 }
 

@@ -103,6 +103,25 @@ export const paymentsController = {
   async create(req: Request, res: Response) {
     const { partnerId, invoiceId, amount, date, method, memo } = req.body;
     if (!partnerId || !amount || !date) throw new ApiError(400, "partnerId, amount, dan date wajib diisi");
+
+    // Manual "Bayar/Lunasi" entry point only -- zarveSync's own auto-created payments
+    // call createPayment() directly (see zarveSync.controller.ts), bypassing this HTTP
+    // handler entirely, so this check can't affect the sync's own behavior. Mirrors the
+    // same outstanding check added to sales/purchases.controller.ts's addPayment.
+    if (invoiceId) {
+      const [rows] = await pool.query(
+        "SELECT total_amount, COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id = i.id), 0) AS amount_paid FROM invoices i WHERE i.id = ?",
+        [invoiceId]
+      );
+      const invoice = (rows as any[])[0];
+      if (!invoice) throw new ApiError(404, "Invoice tidak ditemukan");
+      const outstanding = Math.round((Number(invoice.total_amount) - Number(invoice.amount_paid)) * 100) / 100;
+      if (outstanding <= 0) throw new ApiError(400, "Invoice ini sudah lunas, tidak ada sisa tagihan untuk dibayar");
+      if (Number(amount) > outstanding) {
+        throw new ApiError(400, `Jumlah pembayaran melebihi sisa tagihan (sisa: ${outstanding})`);
+      }
+    }
+
     const payment = await createPayment({
       partnerId,
       invoiceId: invoiceId ?? null,

@@ -227,4 +227,99 @@ export const contactsController = {
       conn.release();
     }
   },
+
+  async update(req: Request, res: Response) {
+    const [ownerRows] = await pool.query("SELECT id FROM contacts WHERE id = ? AND business_unit = ?", [req.params.id, req.businessUnit]);
+    if (!(ownerRows as any[])[0]) throw new ApiError(404, "Kontak tidak ditemukan");
+
+    const {
+      types,
+      name,
+      salutation,
+      firstName,
+      middleName,
+      lastName,
+      companyName,
+      address,
+      shippingAddress,
+      email,
+      mobilePhone,
+      phone,
+      fax,
+      citizenship,
+      npwp,
+      idType,
+      idNumber,
+      nitku,
+      paymentTerm,
+      receivableAccountId,
+      payableAccountId,
+      notes,
+      bankAccounts,
+    } = req.body;
+    if (!name) throw new ApiError(400, "Nama tampilan wajib diisi");
+
+    const resolvedReceivableId = receivableAccountId
+      ? Number(receivableAccountId)
+      : await getAccountIdByCode(DEFAULT_RECEIVABLE_CODE, req.businessUnit);
+    const resolvedPayableId = payableAccountId
+      ? Number(payableAccountId)
+      : await getAccountIdByCode(DEFAULT_PAYABLE_CODE, req.businessUnit);
+
+    const conn: PoolConnection = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      await conn.query(
+        `UPDATE contacts SET
+           name = ?, salutation = ?, first_name = ?, middle_name = ?, last_name = ?, company_name = ?, address = ?,
+           shipping_address = ?, email = ?, mobile_phone = ?, phone = ?, fax = ?, citizenship = ?, npwp = ?,
+           id_type = ?, id_number = ?, nitku = ?, payment_term = ?, receivable_account_id = ?, payable_account_id = ?,
+           notes = ?
+         WHERE id = ?`,
+        [
+          name,
+          salutation || null,
+          firstName || null,
+          middleName || null,
+          lastName || null,
+          companyName || null,
+          address || null,
+          shippingAddress || null,
+          email || null,
+          mobilePhone || null,
+          phone || null,
+          fax || null,
+          citizenship === "wna" ? "wna" : "wni",
+          npwp || null,
+          idType || null,
+          idNumber || null,
+          nitku || null,
+          paymentTerm || null,
+          resolvedReceivableId,
+          resolvedPayableId,
+          notes || null,
+          req.params.id,
+        ]
+      );
+
+      await conn.query("DELETE FROM contact_types WHERE contact_id = ?", [req.params.id]);
+      for (const t of parseTypes(types)) {
+        await conn.query("INSERT INTO contact_types (contact_id, type) VALUES (?, ?)", [req.params.id, t]);
+      }
+      await replaceBankAccounts(conn, Number(req.params.id), parseBankAccounts(bankAccounts));
+
+      await conn.commit();
+
+      const [rows] = await pool.query("SELECT * FROM contacts WHERE id = ?", [req.params.id]);
+      const [typeRows] = await pool.query("SELECT type FROM contact_types WHERE contact_id = ?", [req.params.id]);
+      const [bankRows] = await pool.query("SELECT * FROM contact_bank_accounts WHERE contact_id = ?", [req.params.id]);
+      res.json(mapRow((rows as any[])[0], (typeRows as any[]).map((r) => r.type), bankRows as any[]));
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  },
 };

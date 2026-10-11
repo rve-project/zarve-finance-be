@@ -31,4 +31,5 @@ productsRouter.get("/", productsController.list);
 productsRouter.get("/warehouse-stock", productsController.warehouseStock);
 productsRouter.post("/", productsController.create);
 productsRouter.post("/upload-image", upload.single("image"), productsController.uploadImage);
+productsRouter.get("/:id", productsController.get);
 productsRouter.put("/:id", productsController.update);

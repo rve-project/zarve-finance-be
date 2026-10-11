@@ -7,3 +7,5 @@ export const contactsRouter = Router();
 contactsRouter.use(requireAuth);
 contactsRouter.get("/", contactsController.list);
 contactsRouter.post("/", contactsController.create);
+contactsRouter.get("/:id", contactsController.get);
+contactsRouter.put("/:id", contactsController.update);

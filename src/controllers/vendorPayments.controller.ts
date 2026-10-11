@@ -59,6 +59,20 @@ export const vendorPaymentsController = {
     }
     if (Number(amount) <= 0) throw new ApiError(400, "Jumlah pembayaran harus lebih dari 0");
 
+    if (vendorBillId) {
+      const [rows] = await pool.query(
+        "SELECT total_amount, COALESCE((SELECT SUM(amount) FROM vendor_payments WHERE vendor_bill_id = vb.id), 0) AS amount_paid FROM vendor_bills vb WHERE vb.id = ?",
+        [vendorBillId]
+      );
+      const bill = (rows as any[])[0];
+      if (!bill) throw new ApiError(404, "Tagihan vendor tidak ditemukan");
+      const outstanding = Math.round((Number(bill.total_amount) - Number(bill.amount_paid)) * 100) / 100;
+      if (outstanding <= 0) throw new ApiError(400, "Tagihan ini sudah lunas, tidak ada sisa tagihan untuk dibayar");
+      if (Number(amount) > outstanding) {
+        throw new ApiError(400, `Jumlah pembayaran melebihi sisa tagihan (sisa: ${outstanding})`);
+      }
+    }
+
     const apAccountId = await getAccountIdByCode(WELL_KNOWN_ACCOUNTS.ACCOUNTS_PAYABLE);
 
     const conn = await pool.getConnection();

@@ -12,6 +12,8 @@ import { postJournalEntry, WELL_KNOWN_ACCOUNTS, getAccountIdByCode } from "../ut
  * sheet's AP liability were structurally always zero.
  */
 function mapBillRow(row: any) {
+  const totalAmount = Number(row.total_amount);
+  const amountPaid = Number(row.amount_paid ?? 0);
   return {
     id: row.id,
     number: row.number,
@@ -19,10 +21,14 @@ function mapBillRow(row: any) {
     vendorName: row.vendor_name,
     billDate: row.bill_date,
     ref: row.ref,
-    totalAmount: Number(row.total_amount),
+    totalAmount,
+    amountPaid,
+    outstanding: Math.round((totalAmount - amountPaid) * 100) / 100,
     createdAt: row.created_at,
   };
 }
+
+const AMOUNT_PAID_SQL = "COALESCE((SELECT SUM(amount) FROM vendor_payments WHERE vendor_bill_id = vb.id), 0) AS amount_paid";
 
 function mapLineRow(row: any) {
   return {
@@ -124,7 +130,7 @@ export const vendorBillsController = {
     const total = (countRows as any[])[0].cnt as number;
 
     const [rows] = await pool.query(
-      `SELECT vb.*, p.name AS vendor_name FROM vendor_bills vb JOIN partners p ON p.id = vb.vendor_id ${where}
+      `SELECT vb.*, p.name AS vendor_name, ${AMOUNT_PAID_SQL} FROM vendor_bills vb JOIN partners p ON p.id = vb.vendor_id ${where}
        ORDER BY vb.bill_date DESC, vb.id DESC LIMIT ? OFFSET ?`,
       [...params, limit, (page - 1) * limit]
     );
@@ -133,7 +139,7 @@ export const vendorBillsController = {
 
   async get(req: Request, res: Response) {
     const [rows] = await pool.query(
-      "SELECT vb.*, p.name AS vendor_name FROM vendor_bills vb JOIN partners p ON p.id = vb.vendor_id WHERE vb.id = ?",
+      `SELECT vb.*, p.name AS vendor_name, ${AMOUNT_PAID_SQL} FROM vendor_bills vb JOIN partners p ON p.id = vb.vendor_id WHERE vb.id = ?`,
       [req.params.id]
     );
     const bill = (rows as any[])[0];

@@ -3,12 +3,20 @@ import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { postJournalEntry } from "../utils/ledger";
 import { computeDepreciation, periodDepreciation, SUPPORTED_DEPRECIATION_METHODS } from "../utils/depreciation";
+import { runDueDepreciation } from "../utils/depreciationPosting";
 
 /**
  * Fixed asset register (B2B): buying an asset posts a real journal entry (debit the
  * chosen Fixed Asset account, credit whatever paid for it). Depreciation parameters
- * are stored so book value / a monthly schedule can be computed and shown, but posting
- * depreciation itself stays a manual Jurnal Manual entry for now -- not auto-posted.
+ * are stored so book value / a monthly schedule can be computed and shown on the fly
+ * (see utils/depreciation.ts) -- none of that math on its own ever posts anything.
+ * Actually posting depreciation to the books happens via runDueDepreciation() (see
+ * utils/depreciationPosting.ts), which catches up every due-but-unposted (asset,
+ * month) pair, recording each one in fixed_asset_depreciation_postings so it's never
+ * posted twice. Same dual-trigger pattern as the Zarve mirror sync (scheduler.ts):
+ * runs automatically every night via cron, AND on demand via the "Jalankan
+ * Penyusutan" button below (POST /fixed-assets/run-depreciation) for an immediate run
+ * without waiting for the next cron tick.
  */
 
 function mapAssetRow(row: any) {
@@ -56,6 +64,19 @@ async function findAccountByCategoryValue(businessUnit: string, categoryValue: s
 async function nextAssetNumber(businessUnit: string): Promise<string> {
   const [rows] = await pool.query("SELECT COUNT(*) AS cnt FROM fixed_assets WHERE business_unit = ?", [businessUnit]);
   return String(10001 + (rows as any[])[0].cnt);
+}
+
+/** "YYYY-MM" -> the next calendar month, also "YYYY-MM". */
+function nextMonth(period: string): string {
+  const [y, m] = period.split("-").map(Number);
+  return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
+}
+
+/** "YYYY-MM" -> that month's last day, "YYYY-MM-DD" -- depreciation posts as of
+ * month-end, the standard convention. */
+function lastDayOfMonth(period: string): string {
+  const [y, m] = period.split("-").map(Number);
+  return `${period}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`;
 }
 
 export const fixedAssetsController = {
@@ -161,13 +182,15 @@ export const fixedAssetsController = {
     const periodStart = `${month}-01`;
 
     const [rows] = await pool.query(
-      `SELECT fa.*, a.code AS category_account_code, a.name AS category_account_name
+      `SELECT fa.*, a.code AS category_account_code, a.name AS category_account_name,
+         fadp.journal_entry_id AS posted_journal_entry_id
        FROM fixed_assets fa
        JOIN accounts a ON a.id = fa.category_account_id
+       LEFT JOIN fixed_asset_depreciation_postings fadp ON fadp.fixed_asset_id = fa.id AND fadp.period = ?
        WHERE fa.business_unit = ? AND fa.status = 'active' AND fa.is_non_depreciating = FALSE
          AND fa.acquisition_date <= LAST_DAY(?)
        ORDER BY fa.name`,
-      [req.businessUnit, periodStart]
+      [month, req.businessUnit, periodStart]
     );
 
     const data = (rows as any[])
@@ -183,7 +206,7 @@ export const fixedAssetsController = {
           },
           periodStart
         );
-        return { asset, amount };
+        return { asset, amount, postedJournalEntryId: r.posted_journal_entry_id };
       })
       .filter((r) => r.amount > 0)
       .map((r) => ({
@@ -194,9 +217,25 @@ export const fixedAssetsController = {
         method: r.asset.depreciationMethod,
         value: r.asset.acquisitionCost,
         amount: r.amount,
+        posted: r.postedJournalEntryId !== null,
+        journalEntryId: r.postedJournalEntryId,
       }));
 
     res.json({ month, data });
+  },
+
+  /**
+   * "Jalankan Penyusutan" -- catches up every (asset, month) pair from each asset's
+   * acquisition month through `throughMonth` (inclusive) that's due (periodDepreciation
+   * > 0) but not yet in fixed_asset_depreciation_postings, posting one journal entry
+   * per period (Debit depreciation expense, Credit accumulated depreciation) dated at
+   * that month's last day. Button-triggered, not a cron -- see the controller's top
+   * comment for why.
+   */
+  async runDepreciation(req: Request, res: Response) {
+    const throughMonth = (req.query.throughMonth as string) || new Date().toISOString().slice(0, 7);
+    const result = await runDueDepreciation(req.businessUnit, throughMonth);
+    res.json(result);
   },
 
   async create(req: Request, res: Response) {
@@ -226,9 +265,15 @@ export const fixedAssetsController = {
     if (!isNonDepreciating && !sourceJournalLineId && (!usefulLifeYears || Number(usefulLifeYears) <= 0)) {
       throw new ApiError(400, "Masa manfaat wajib diisi untuk aset yang disusutkan");
     }
-    const finalAssetType = assetType === "vehicle" ? "vehicle" : "general";
-    if (finalAssetType === "vehicle" && !plateNumber) {
-      throw new ApiError(400, "Plat nomor wajib diisi untuk aset berupa kendaraan operasional");
+    const finalAssetType = assetType || "Umum";
+    const [typeRows] = await pool.query(
+      "SELECT requires_plate_number FROM fixed_asset_types WHERE business_unit = ? AND name = ? AND is_active = TRUE",
+      [req.businessUnit, finalAssetType]
+    );
+    const typeRow = (typeRows as any[])[0];
+    if (!typeRow) throw new ApiError(400, "Jenis aset tidak ditemukan atau sudah dinonaktifkan");
+    if (typeRow.requires_plate_number && !plateNumber) {
+      throw new ApiError(400, `Plat nomor wajib diisi untuk jenis aset "${finalAssetType}"`);
     }
 
     const finalAssetNumber = assetNumber || (await nextAssetNumber(req.businessUnit));
@@ -275,7 +320,7 @@ export const fixedAssetsController = {
         name,
         description || null,
         finalAssetType,
-        finalAssetType === "vehicle" ? String(plateNumber).trim() : null,
+        typeRow.requires_plate_number ? String(plateNumber).trim() : null,
         Number(categoryAccountId),
         acquisitionDate,
         Number(acquisitionCost),
@@ -475,5 +520,72 @@ export const fixedAssetsController = {
         createdAt: r.created_at,
       }))
     );
+  },
+
+  /**
+   * Full month-by-month schedule for one asset's whole useful life (not just one
+   * month, unlike depreciationSchedule above) -- computed fresh on every call from the
+   * asset's CURRENT parameters, so editing the asset (cost, useful life, opening
+   * accumulated depreciation) automatically changes every not-yet-posted row the next
+   * time this is read. Nothing about "not yet posted" is stored -- only actually
+   * posted periods (fixed_asset_depreciation_postings) are a real durable fact; a
+   * future row is just today's math, recomputed, same as Odoo's draft entries except
+   * without a draft journal_entries row sitting in the database for it.
+   */
+  async depreciationBoard(req: Request, res: Response) {
+    const [assetRows] = await pool.query(
+      `SELECT fa.*, a.code AS category_account_code, a.name AS category_account_name
+       FROM fixed_assets fa JOIN accounts a ON a.id = fa.category_account_id WHERE fa.id = ?`,
+      [req.params.id]
+    );
+    const row = (assetRows as any[])[0];
+    if (!row || row.business_unit !== req.businessUnit) throw new ApiError(404, "Aset tidak ditemukan");
+    const asset = mapAssetRow(row);
+
+    if (asset.isNonDepreciating || !asset.usefulLifeYears) {
+      return res.json({ assetId: asset.id, assetName: asset.name, assetNumber: asset.assetNumber, rows: [] });
+    }
+
+    const [postedRows] = await pool.query(
+      "SELECT period, journal_entry_id FROM fixed_asset_depreciation_postings WHERE fixed_asset_id = ?",
+      [asset.id]
+    );
+    const postedMap = new Map((postedRows as any[]).map((r) => [r.period as string, r.journal_entry_id as number]));
+
+    const depreciationInput = {
+      acquisitionDate: asset.acquisitionDate,
+      acquisitionCost: asset.acquisitionCost,
+      isNonDepreciating: false,
+      usefulLifeYears: asset.usefulLifeYears,
+      openingAccumulatedDepreciation: asset.openingAccumulatedDepreciation,
+    };
+
+    const totalMonths = asset.usefulLifeYears * 12;
+    let month = asset.acquisitionDate.slice(0, 7);
+    const scheduleRows: {
+      period: string;
+      amount: number;
+      cumulativeDepreciation: number;
+      remainingBookValue: number;
+      posted: boolean;
+      journalEntryId: number | null;
+    }[] = [];
+
+    for (let i = 0; i < totalMonths; i++) {
+      const amount = periodDepreciation(depreciationInput, `${month}-01`);
+      if (amount <= 0) break; // fully depreciated -- nothing left to schedule
+      const dep = computeDepreciation(depreciationInput, lastDayOfMonth(month));
+      scheduleRows.push({
+        period: month,
+        amount,
+        cumulativeDepreciation: dep.accumulatedDepreciation,
+        remainingBookValue: dep.bookValue,
+        posted: postedMap.has(month),
+        journalEntryId: postedMap.get(month) ?? null,
+      });
+      month = nextMonth(month);
+    }
+
+    res.json({ assetId: asset.id, assetName: asset.name, assetNumber: asset.assetNumber, rows: scheduleRows });
   },
 };

@@ -211,6 +211,31 @@ export const productsController = {
     res.status(201).json(mapRow((rows as any[])[0]));
   },
 
+  async get(req: Request, res: Response) {
+    const [rows] = await pool.query(`${SELECT_WITH_CATEGORY} WHERE p.id = ?`, [req.params.id]);
+    const row = (rows as any[])[0];
+    if (!row || row.business_unit !== req.businessUnit) throw new ApiError(404, "Produk tidak ditemukan");
+
+    const product = mapRow(row);
+    if (product.productType === "bundle") {
+      const [componentRows] = await pool.query(
+        `SELECT bc.component_product_id, bc.qty, p.name, p.code, p.unit
+         FROM product_bundle_components bc
+         JOIN products p ON p.id = bc.component_product_id
+         WHERE bc.bundle_product_id = ?`,
+        [req.params.id]
+      );
+      (product as any).bundleComponents = (componentRows as any[]).map((r) => ({
+        productId: r.component_product_id,
+        name: r.name,
+        code: r.code,
+        unit: r.unit,
+        qty: Number(r.qty),
+      }));
+    }
+    res.json(product);
+  },
+
   /** Per-warehouse stock for every qty-tracked product, at one warehouse (null =
    * "Unassigned") -- lets the Transfer Gudang form show "Qty sebelum" live as soon as a
    * "Dari gudang" is picked, instead of only finding out at submit time. */

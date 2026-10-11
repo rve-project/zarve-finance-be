@@ -2,7 +2,7 @@ import { Request, Response } from "express";
 import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
-import { postJournalEntry, getAccountIdByCode } from "../utils/ledger";
+import { postJournalEntry, getAccountIdByCode, resolveTaxJournalLines } from "../utils/ledger";
 import { adjustWarehouseStock } from "../utils/warehouseStock";
 
 /**
@@ -145,6 +145,9 @@ export interface SaleLineInput {
 }
 
 export interface SaleDocInput {
+  /** Create-only override -- when omitted, falls back to the auto sequence. Updates
+   * never touch the number, matching every other document type in this app. */
+  number?: string | null;
   contactId?: number | null;
   documentDate: string;
   dueDate?: string | null;
@@ -206,15 +209,16 @@ async function resolveLineAccounts(lines: SaleLineInput[]): Promise<ResolvedLine
 
 /** Posts the invoice's journal entry: debit the customer's mapped Akun Piutang (or the
  * generic default) for the net total, debit Diskon Penjualan for any discount, credit
- * each line's resolved income account, credit PPN Keluaran for the tax total. */
+ * each line's resolved income account, credit each tax's own mapped account (or PPN
+ * Keluaran as the default) for its share of the tax total. */
 async function postInvoiceJournal(
   businessUnit: "zarve" | "b2b",
   doc: { id: number; number: string; documentDate: string; contactId: number | null; taxTotal: number; totalAmount: number; discountAmount: number },
   resolvedLines: ResolvedLine[],
+  taxLines: { accountId: number; amount: number; sign: 1 | -1 }[],
   conn: PoolConnection
 ) {
   const receivableAccountId = await resolveReceivableAccountId(businessUnit, doc.contactId);
-  const ppnKeluaranId = doc.taxTotal > 0 ? await getAccountIdByCode(B2B_ACCOUNTS.PPN_KELUARAN, businessUnit) : null;
   const diskonPenjualanId =
     doc.discountAmount > 0 ? await getAccountIdByCode(B2B_ACCOUNTS.DISKON_PENJUALAN, businessUnit) : null;
 
@@ -230,7 +234,10 @@ async function postInvoiceJournal(
         { accountId: receivableAccountId, partnerId: doc.contactId, debit: doc.totalAmount, credit: 0 },
         ...(diskonPenjualanId && doc.discountAmount > 0 ? [{ accountId: diskonPenjualanId, debit: doc.discountAmount, credit: 0 }] : []),
         ...resolvedLines.filter((l) => l.accountId).map((l) => ({ accountId: l.accountId!, debit: 0, credit: l.amount })),
-        ...(ppnKeluaranId && doc.taxTotal > 0 ? [{ accountId: ppnKeluaranId, debit: 0, credit: doc.taxTotal }] : []),
+        // sign 1 (e.g. PPN Keluaran) credits as usual (a liability); sign -1 (e.g. a
+        // withheld PPh 23 component of a compound tax) debits instead -- it reduces
+        // what the customer actually pays, see resolveTaxJournalLines in utils/ledger.ts.
+        ...taxLines.map((t) => (t.sign === 1 ? { accountId: t.accountId, debit: 0, credit: t.amount } : { accountId: t.accountId, debit: t.amount, credit: 0 })),
       ],
     },
     conn
@@ -352,7 +359,11 @@ export const salesController = {
     if (!DOC_TYPES.includes(docType)) throw new ApiError(400, "Tipe dokumen tidak valid");
 
     const totals = computeTotals(input.lines, input.discountAmount);
-    const number = await nextNumber(req.businessUnit, docType, input.documentDate);
+    if (input.number) {
+      const [dupRows] = await pool.query("SELECT id FROM sale_documents WHERE business_unit = ? AND number = ?", [req.businessUnit, input.number]);
+      if ((dupRows as any[]).length) throw new ApiError(400, `Nomor dokumen "${input.number}" sudah dipakai`);
+    }
+    const number = input.number || (await nextNumber(req.businessUnit, docType, input.documentDate));
     const status: SaleStatus = input.submitForApproval ? "pending_approval" : "draft";
 
     const [result] = await pool.query(
@@ -484,7 +495,7 @@ export const salesController = {
 
       if (doc.doc_type === "invoice") {
         const [lineRows] = await conn.query(
-          "SELECT product_id, account_id, qty, amount, tax_amount FROM sale_document_lines WHERE document_id = ?",
+          "SELECT product_id, account_id, qty, amount, tax_id, tax_amount FROM sale_document_lines WHERE document_id = ?",
           [id]
         );
         const rawLines = (lineRows as any[]).map((l) => ({
@@ -492,10 +503,12 @@ export const salesController = {
           accountId: l.account_id,
           qty: Number(l.qty),
           amount: Number(l.amount),
+          taxId: l.tax_id,
           taxAmount: Number(l.tax_amount),
           unitPrice: 0,
         }));
         const resolvedLines = await resolveLineAccounts(rawLines);
+        const taxLines = await resolveTaxJournalLines(rawLines, B2B_ACCOUNTS.PPN_KELUARAN, req.businessUnit);
         await postInvoiceJournal(
           req.businessUnit,
           {
@@ -508,6 +521,7 @@ export const salesController = {
             discountAmount: Number(doc.discount_amount ?? 0),
           },
           resolvedLines,
+          taxLines,
           conn
         );
 
@@ -612,7 +626,7 @@ export const salesController = {
 
   async addPayment(req: Request, res: Response) {
     const id = Number(req.params.id);
-    const [rows] = await pool.query("SELECT * FROM sale_documents WHERE id = ?", [id]);
+    const [rows] = await pool.query(`SELECT sd.*,${PAID_AND_CREDITED_SQL} FROM sale_documents sd WHERE sd.id = ?`, [id]);
     const doc = (rows as any[])[0];
     if (!doc || doc.business_unit !== req.businessUnit) throw new ApiError(404, "Dokumen penjualan tidak ditemukan");
     if (doc.doc_type !== "invoice" || doc.status !== "approved") {
@@ -621,6 +635,15 @@ export const salesController = {
 
     const { bankAccountId, amount, paymentDate, memo } = req.body;
     if (!bankAccountId || !amount || !paymentDate) throw new ApiError(400, "Akun bayar, jumlah, dan tanggal wajib diisi");
+
+    // Nothing else re-checks this on its own -- without it, recording a payment never
+    // stopped at the invoice's own total, so "Sisa Tagihan" could go (and stay) negative
+    // while the "Catat Pelunasan" button kept accepting more payments on top.
+    const outstanding = round2(Number(doc.total_amount) - Number(doc.total_paid) - Number(doc.total_credited ?? 0));
+    if (outstanding <= 0) throw new ApiError(400, "Faktur ini sudah lunas, tidak ada sisa tagihan untuk dibayar");
+    if (Number(amount) > outstanding) {
+      throw new ApiError(400, `Jumlah pembayaran melebihi sisa tagihan (sisa: ${outstanding})`);
+    }
 
     const receivableAccountId = await resolveReceivableAccountId(req.businessUnit, doc.contact_id);
 
@@ -683,6 +706,7 @@ async function insertLines(documentId: number, lines: SaleLineInput[]) {
 
 function parseSaleInput(body: any): SaleDocInput {
   const {
+    number,
     contactId,
     documentDate,
     dueDate,
@@ -703,6 +727,7 @@ function parseSaleInput(body: any): SaleDocInput {
   if (!Array.isArray(lines) || !lines.length) throw new ApiError(400, "Minimal 1 baris wajib diisi");
 
   return {
+    number: number ? String(number).trim() || null : null,
     contactId: contactId ? Number(contactId) : null,
     documentDate,
     dueDate: dueDate || null,

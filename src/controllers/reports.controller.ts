@@ -1,11 +1,26 @@
 import { Request, Response } from "express";
+import * as XLSX from "xlsx";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
-import { getAccountBalances, getGeneralLedgerLines } from "../utils/reportEngine";
+import { AccountBalanceRow, getAccountBalances, getGeneralLedgerLines } from "../utils/reportEngine";
 import { toUtcIso } from "../utils/zarveMirror";
 import { getAccountIdByCode, WELL_KNOWN_ACCOUNTS } from "../utils/ledger";
+import { BusinessUnit } from "../models/types";
 
 const EPOCH = "1970-01-01";
+
+/** Shared xlsx-buffer responder for every report export below -- one sheet, a title
+ * row, then a header row, then data rows (plain arrays, SheetJS infers columns). */
+function sendXlsx(res: Response, sheetName: string, filename: string, title: string, header: string[], rows: (string | number)[][]) {
+  const sheetData = [[title], header, ...rows];
+  const worksheet = XLSX.utils.aoa_to_sheet(sheetData);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+  const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.send(buffer);
+}
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -17,11 +32,168 @@ function requireDateRange(req: Request): { from: string; to: string } {
   return { from, to };
 }
 
+/** Shared between balanceSheet and exportBalanceSheet -- see the synthetic
+ * "Laba Ditahan (Berjalan)" row comment inline below for why this exists. */
+async function buildBalanceSheet(businessUnit: BusinessUnit, asOf: string) {
+  const rows = await getAccountBalances({ from: EPOCH, to: asOf, businessUnit });
+
+  const assets = rows.filter((r) => r.account.type === "asset");
+  const liabilities = rows.filter((r) => r.account.type === "liability");
+  const equity = rows.filter((r) => r.account.type === "equity");
+
+  // Income/expense accounts aren't part of the balance sheet on their own, but their
+  // net (since inception) IS part of equity -- without a period-closing step (which
+  // this system doesn't do), cumulative net income has nowhere else to live. Without
+  // this line, Assets would never equal Liabilities + Equity for a business that's
+  // actually made money. Same convention most accounting software uses for an as-of
+  // balance sheet before formal year-end closing (e.g. Xero/QuickBooks' "Net Income"
+  // equity line).
+  const incomeExpenseRows = rows.filter((r) => r.account.type === "income" || r.account.type === "expense");
+  const netIncomeToDate = incomeExpenseRows.reduce(
+    (sum, r) => sum + (r.account.type === "income" ? r.endBalance : -r.endBalance),
+    0
+  );
+  const netIncomeRow: AccountBalanceRow = {
+    account: {
+      id: 0,
+      code: "3900",
+      name: "Laba Ditahan (Berjalan)",
+      type: "equity" as const,
+      parentId: null,
+      isActive: true,
+      businessUnit,
+      description: null,
+      categoryId: null,
+      taxId: null,
+      bankName: null,
+      accessMode: "all",
+    },
+    initialBalance: 0,
+    periodDebit: 0,
+    periodCredit: 0,
+    endBalance: netIncomeToDate,
+  };
+  const equityWithNetIncome = [...equity, netIncomeRow];
+
+  const totalAssets = assets.reduce((sum, r) => sum + r.endBalance, 0);
+  const totalLiabilities = liabilities.reduce((sum, r) => sum + r.endBalance, 0);
+  const totalEquity = equityWithNetIncome.reduce((sum, r) => sum + r.endBalance, 0);
+
+  return {
+    asOf,
+    assets,
+    liabilities,
+    equity: equityWithNetIncome,
+    totalAssets,
+    totalLiabilities,
+    totalEquity,
+  };
+}
+
+/**
+ * Laporan Perubahan Modal (Statement of Changes in Equity). Reuses the exact same
+ * cumulative-since-epoch convention as buildBalanceSheet's synthetic "Laba Ditahan
+ * (Berjalan)" row -- this system never posts a period-closing entry, so an equity
+ * account's `initialBalance` from getAccountBalances (sum of everything before `from`)
+ * already IS "Saldo Awal" for this report, and `endBalance` already IS "Saldo Akhir".
+ * Net income needs its own synthetic row for the same reason the balance sheet does:
+ * income/expense accounts aren't equity accounts, but their running total since
+ * inception belongs in equity. The beginning/ending split here (rather than
+ * balanceSheet's single as-of total) is what makes the two reports reconcile: running
+ * this report with `to` equal to a balance sheet's `asOf` date, `totalEnding` here must
+ * equal that balance sheet's `totalEquity`.
+ */
+async function buildEquityChanges(businessUnit: BusinessUnit, from: string, to: string) {
+  const equityRows = await getAccountBalances({ from, to, types: ["equity"], businessUnit });
+  const incomeExpenseRows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit });
+
+  const netIncomeBeginning = incomeExpenseRows.reduce(
+    (sum, r) => sum + (r.account.type === "income" ? r.initialBalance : -r.initialBalance),
+    0
+  );
+  const netIncomeEnding = incomeExpenseRows.reduce(
+    (sum, r) => sum + (r.account.type === "income" ? r.endBalance : -r.endBalance),
+    0
+  );
+  const netIncomeRow: AccountBalanceRow = {
+    account: {
+      id: 0,
+      code: "3900",
+      name: "Laba Ditahan (Berjalan)",
+      type: "equity" as const,
+      parentId: null,
+      isActive: true,
+      businessUnit,
+      description: null,
+      categoryId: null,
+      taxId: null,
+      bankName: null,
+      accessMode: "all",
+    },
+    initialBalance: netIncomeBeginning,
+    periodDebit: 0,
+    periodCredit: 0,
+    endBalance: netIncomeEnding,
+  };
+
+  const rows = [...equityRows, netIncomeRow];
+  const totalBeginning = rows.reduce((sum, r) => sum + r.initialBalance, 0);
+  const totalEnding = rows.reduce((sum, r) => sum + r.endBalance, 0);
+
+  return { from, to, rows, totalBeginning, totalMovement: totalEnding - totalBeginning, totalEnding };
+}
+
+/** Shared between cashFlow and exportCashFlow -- see cashFlow's own doc comment below
+ * for why the cash-account detection differs between business units. */
+async function buildCashFlow(businessUnit: BusinessUnit, from: string, to: string) {
+  const rows = await getAccountBalances({ from, to, types: ["asset"], businessUnit });
+
+  let cashAccounts;
+  if (businessUnit === "b2b") {
+    const [catRows] = await pool.query("SELECT id FROM account_categories WHERE business_unit = 'b2b' AND value = 'cash_bank'");
+    const cashBankCategoryId = (catRows as any[])[0]?.id;
+    cashAccounts = rows.filter((r) => r.account.categoryId === cashBankCategoryId);
+  } else {
+    cashAccounts = rows.filter((r) => r.account.code.startsWith("11"));
+  }
+
+  const beginningBalance = cashAccounts.reduce((sum, r) => sum + r.initialBalance, 0);
+  const endingBalance = cashAccounts.reduce((sum, r) => sum + r.endBalance, 0);
+  const cashIn = cashAccounts.reduce((sum, r) => sum + r.periodDebit, 0);
+  const cashOut = cashAccounts.reduce((sum, r) => sum + r.periodCredit, 0);
+
+  return {
+    from,
+    to,
+    accounts: cashAccounts,
+    beginningBalance,
+    cashIn,
+    cashOut,
+    netChange: cashIn - cashOut,
+    endingBalance,
+  };
+}
+
 export const reportsController = {
   async trialBalance(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
     const rows = await getAccountBalances({ from, to, businessUnit: req.businessUnit });
     res.json({ from, to, rows });
+  },
+
+  async exportTrialBalance(req: Request, res: Response) {
+    const { from, to } = requireDateRange(req);
+    const rows = await getAccountBalances({ from, to, businessUnit: req.businessUnit });
+    const active = rows.filter((r) => r.initialBalance !== 0 || r.periodDebit !== 0 || r.periodCredit !== 0 || r.endBalance !== 0);
+
+    sendXlsx(
+      res,
+      "Trial Balance",
+      `Trial Balance ${from} - ${to}.xlsx`,
+      `Trial Balance ${from} s/d ${to}`,
+      ["Kode", "Nama Akun", "Saldo Awal", "Debit", "Kredit", "Saldo Akhir"],
+      active.map((r) => [r.account.code, r.account.name, r.initialBalance, r.periodDebit, r.periodCredit, r.endBalance])
+    );
   },
 
   async generalLedger(req: Request, res: Response) {
@@ -35,6 +207,28 @@ export const reportsController = {
     const limit = req.query.limit ? Number(req.query.limit) : 50;
     const { lines, total, totalDebit, totalCredit, endBalance } = await getGeneralLedgerLines(accountId, from, to, page, limit);
     res.json({ from, to, accountId, lines, total, page, limit, totalDebit, totalCredit, endBalance });
+  },
+
+  async exportGeneralLedger(req: Request, res: Response) {
+    const { from, to } = requireDateRange(req);
+    const accountId = Number(req.query.accountId);
+    if (!accountId) throw new ApiError(400, "accountId wajib diisi");
+    const [accountRows] = await pool.query("SELECT code, name, business_unit FROM accounts WHERE id = ?", [accountId]);
+    const account = (accountRows as any[])[0];
+    if (!account || account.business_unit !== req.businessUnit) throw new ApiError(404, "Akun tidak ditemukan");
+
+    // No pagination here -- the whole account/period's movement goes into the file,
+    // unlike the JSON endpoint above which pages for the on-screen table.
+    const { lines } = await getGeneralLedgerLines(accountId, from, to, 1, Number.MAX_SAFE_INTEGER);
+
+    sendXlsx(
+      res,
+      "General Ledger",
+      `General Ledger ${account.code} ${from} - ${to}.xlsx`,
+      `General Ledger - ${account.code} ${account.name} (${from} s/d ${to})`,
+      ["Tanggal", "Ref", "Partner", "Keterangan", "Debit", "Kredit", "Saldo"],
+      lines.map((l) => [l.date, l.ref ?? "", l.partnerName ?? "", l.narration ?? "", l.debit, l.credit, l.runningBalance])
+    );
   },
 
   async profitAndLoss(req: Request, res: Response) {
@@ -57,56 +251,90 @@ export const reportsController = {
     });
   },
 
+  async exportProfitAndLoss(req: Request, res: Response) {
+    const { from, to } = requireDateRange(req);
+    const rows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit: req.businessUnit });
+
+    const income = rows.filter((r) => r.account.type === "income" && (r.periodCredit !== 0 || r.periodDebit !== 0));
+    const expense = rows.filter((r) => r.account.type === "expense" && (r.periodDebit !== 0 || r.periodCredit !== 0));
+    const totalIncome = income.reduce((sum, r) => sum + r.periodCredit - r.periodDebit, 0);
+    const totalExpense = expense.reduce((sum, r) => sum + r.periodDebit - r.periodCredit, 0);
+
+    const dataRows: (string | number)[][] = [
+      ["Pendapatan", ""],
+      ...income.map((r) => [r.account.name, r.periodCredit - r.periodDebit]),
+      ["Total Pendapatan", totalIncome],
+      ["", ""],
+      ["Beban", ""],
+      ...expense.map((r) => [r.account.name, r.periodDebit - r.periodCredit]),
+      ["Total Beban", totalExpense],
+      ["", ""],
+      ["Laba Bersih", totalIncome - totalExpense],
+    ];
+
+    sendXlsx(
+      res,
+      "Laba Rugi",
+      `Laba Rugi ${from} - ${to}.xlsx`,
+      `Laba Rugi ${from} s/d ${to}`,
+      ["Nama Akun", "Jumlah"],
+      dataRows
+    );
+  },
+
   async balanceSheet(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
-    const rows = await getAccountBalances({ from: EPOCH, to: asOf, businessUnit: req.businessUnit });
+    const result = await buildBalanceSheet(req.businessUnit, asOf);
+    res.json(result);
+  },
 
-    const assets = rows.filter((r) => r.account.type === "asset");
-    const liabilities = rows.filter((r) => r.account.type === "liability");
-    const equity = rows.filter((r) => r.account.type === "equity");
+  async exportBalanceSheet(req: Request, res: Response) {
+    const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
+    const { assets, liabilities, equity, totalAssets, totalLiabilities, totalEquity } = await buildBalanceSheet(req.businessUnit, asOf);
 
-    // Income/expense accounts aren't part of the balance sheet on their own, but their
-    // net (since inception) IS part of equity -- without a period-closing step (which
-    // this system doesn't do), cumulative net income has nowhere else to live. Without
-    // this line, Assets would never equal Liabilities + Equity for a business that's
-    // actually made money. Same convention most accounting software uses for an as-of
-    // balance sheet before formal year-end closing (e.g. Xero/QuickBooks' "Net Income"
-    // equity line).
-    const incomeExpenseRows = rows.filter((r) => r.account.type === "income" || r.account.type === "expense");
-    const netIncomeToDate = incomeExpenseRows.reduce(
-      (sum, r) => sum + (r.account.type === "income" ? r.endBalance : -r.endBalance),
-      0
+    const section = (title: string, rows: AccountBalanceRow[], total: number): (string | number)[][] => [
+      [title, ""],
+      ...rows.filter((r) => r.endBalance !== 0).map((r) => [r.account.name, r.endBalance]),
+      [`Total ${title}`, total],
+      ["", ""],
+    ];
+
+    sendXlsx(
+      res,
+      "Neraca",
+      `Neraca ${asOf}.xlsx`,
+      `Neraca per ${asOf}`,
+      ["Nama Akun", "Saldo"],
+      [
+        ...section("Aset", assets, totalAssets),
+        ...section("Liabilitas", liabilities, totalLiabilities),
+        ...section("Ekuitas", equity, totalEquity),
+        ["Total Liabilitas + Ekuitas", totalLiabilities + totalEquity],
+      ]
     );
-    const netIncomeRow = {
-      account: {
-        id: 0,
-        code: "3900",
-        name: "Laba Ditahan (Berjalan)",
-        type: "equity" as const,
-        parentId: null,
-        isActive: true,
-        businessUnit: req.businessUnit,
-      },
-      initialBalance: 0,
-      periodDebit: 0,
-      periodCredit: 0,
-      endBalance: netIncomeToDate,
-    };
-    const equityWithNetIncome = [...equity, netIncomeRow];
+  },
 
-    const totalAssets = assets.reduce((sum, r) => sum + r.endBalance, 0);
-    const totalLiabilities = liabilities.reduce((sum, r) => sum + r.endBalance, 0);
-    const totalEquity = equityWithNetIncome.reduce((sum, r) => sum + r.endBalance, 0);
+  async equityChanges(req: Request, res: Response) {
+    const { from, to } = requireDateRange(req);
+    const result = await buildEquityChanges(req.businessUnit, from, to);
+    res.json(result);
+  },
 
-    res.json({
-      asOf,
-      assets,
-      liabilities,
-      equity: equityWithNetIncome,
-      totalAssets,
-      totalLiabilities,
-      totalEquity,
-    });
+  async exportEquityChanges(req: Request, res: Response) {
+    const { from, to } = requireDateRange(req);
+    const { rows, totalBeginning, totalMovement, totalEnding } = await buildEquityChanges(req.businessUnit, from, to);
+
+    sendXlsx(
+      res,
+      "Perubahan Modal",
+      `Laporan Perubahan Modal ${from} - ${to}.xlsx`,
+      `Laporan Perubahan Modal ${from} s/d ${to}`,
+      ["Kode", "Nama Akun", "Saldo Awal", "Perubahan", "Saldo Akhir"],
+      [
+        ...rows.map((r) => [r.account.code, r.account.name, r.initialBalance, r.endBalance - r.initialBalance, r.endBalance]),
+        ["", "Total Ekuitas", totalBeginning, totalMovement, totalEnding],
+      ]
+    );
   },
 
   /**
@@ -121,34 +349,24 @@ export const reportsController = {
    */
   async cashFlow(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, types: ["asset"], businessUnit: req.businessUnit });
+    res.json(await buildCashFlow(req.businessUnit, from, to));
+  },
 
-    let cashAccounts;
-    if (req.businessUnit === "b2b") {
-      const [catRows] = await pool.query(
-        "SELECT id FROM account_categories WHERE business_unit = 'b2b' AND value = 'cash_bank'"
-      );
-      const cashBankCategoryId = (catRows as any[])[0]?.id;
-      cashAccounts = rows.filter((r) => r.account.categoryId === cashBankCategoryId);
-    } else {
-      cashAccounts = rows.filter((r) => r.account.code.startsWith("11"));
-    }
+  async exportCashFlow(req: Request, res: Response) {
+    const { from, to } = requireDateRange(req);
+    const { accounts, beginningBalance, cashIn, cashOut, endingBalance } = await buildCashFlow(req.businessUnit, from, to);
 
-    const beginningBalance = cashAccounts.reduce((sum, r) => sum + r.initialBalance, 0);
-    const endingBalance = cashAccounts.reduce((sum, r) => sum + r.endBalance, 0);
-    const cashIn = cashAccounts.reduce((sum, r) => sum + r.periodDebit, 0);
-    const cashOut = cashAccounts.reduce((sum, r) => sum + r.periodCredit, 0);
-
-    res.json({
-      from,
-      to,
-      accounts: cashAccounts,
-      beginningBalance,
-      cashIn,
-      cashOut,
-      netChange: cashIn - cashOut,
-      endingBalance,
-    });
+    sendXlsx(
+      res,
+      "Arus Kas",
+      `Arus Kas ${from} - ${to}.xlsx`,
+      `Arus Kas ${from} s/d ${to}`,
+      ["Akun", "Saldo Awal", "Masuk", "Keluar", "Saldo Akhir"],
+      [
+        ...accounts.map((r) => [r.account.name, r.initialBalance, r.periodDebit, r.periodCredit, r.endBalance]),
+        ["Total", beginningBalance, cashIn, cashOut, endingBalance],
+      ]
+    );
   },
 
   /**

@@ -2,7 +2,7 @@ import { Request, Response } from "express";
 import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
-import { postJournalEntry, getAccountIdByCode } from "../utils/ledger";
+import { postJournalEntry, getAccountIdByCode, resolveTaxJournalLines } from "../utils/ledger";
 
 /**
  * "Pengeluaran" (Mekari Jurnal's "Buat Biaya") -- a one-step expense: paid immediately
@@ -92,6 +92,10 @@ export interface CreateExpenseLineInput {
 }
 
 export interface CreateExpenseInput {
+  /** Optional manual override for the document number -- left blank, nextExpenseNumber()
+   * assigns the usual EXP/YYYY/NNNNN sequence (create only; update always keeps the
+   * existing expense's number regardless of this field). */
+  number?: string | null;
   contactId?: number | null;
   expenseDate: string;
   paymentMethod?: string | null;
@@ -136,20 +140,29 @@ async function resolveExpensePosting(businessUnit: "zarve" | "b2b", input: Creat
   const creditAccountId = input.payLater
     ? await resolvePayableAccountId(businessUnit, input.contactId)
     : input.bankAccountId!;
-  const ppnMasukanId = totalTax > 0 ? await getAccountIdByCode(B2B_ACCOUNTS.PPN_MASUKAN, businessUnit) : null;
+  const taxLines = await resolveTaxJournalLines(input.lines, B2B_ACCOUNTS.PPN_MASUKAN, businessUnit);
   const diskonPembelianId =
     input.discountAmount > 0 ? await getAccountIdByCode(B2B_ACCOUNTS.DISKON_PEMBELIAN, businessUnit) : null;
 
-  return { total, totalTax, creditAccountId, ppnMasukanId, diskonPembelianId };
+  return { total, totalTax, creditAccountId, taxLines, diskonPembelianId };
 }
 
 function journalLinesFor(
   input: CreateExpenseInput,
-  resolved: { total: number; totalTax: number; creditAccountId: number; ppnMasukanId: number | null; diskonPembelianId: number | null }
+  resolved: {
+    total: number;
+    totalTax: number;
+    creditAccountId: number;
+    taxLines: { accountId: number; amount: number; sign: 1 | -1 }[];
+    diskonPembelianId: number | null;
+  }
 ) {
   return [
     ...input.lines.map((l) => ({ accountId: l.accountId, debit: l.amount, credit: 0 })),
-    ...(resolved.ppnMasukanId && resolved.totalTax > 0 ? [{ accountId: resolved.ppnMasukanId, debit: resolved.totalTax, credit: 0 }] : []),
+    // sign 1 (e.g. PPN Masukan) follows this doc type's normal input-tax direction
+    // (debit, an asset); sign -1 (e.g. PPh 23 withheld) posts the opposite way (credit,
+    // a payable to the tax office) -- see resolveTaxJournalLines in utils/ledger.ts.
+    ...resolved.taxLines.map((t) => (t.sign === 1 ? { accountId: t.accountId, debit: t.amount, credit: 0 } : { accountId: t.accountId, debit: 0, credit: t.amount })),
     ...(resolved.diskonPembelianId && input.discountAmount > 0
       ? [{ accountId: resolved.diskonPembelianId, debit: 0, credit: input.discountAmount }]
       : []),
@@ -159,7 +172,12 @@ function journalLinesFor(
 
 export async function createExpense(businessUnit: "zarve" | "b2b", input: CreateExpenseInput) {
   const resolved = await resolveExpensePosting(businessUnit, input);
-  const number = await nextExpenseNumber(businessUnit, input.expenseDate);
+  const manualNumber = input.number?.trim() || null;
+  if (manualNumber) {
+    const [dupRows] = await pool.query("SELECT id FROM expenses WHERE business_unit = ? AND number = ?", [businessUnit, manualNumber]);
+    if ((dupRows as any[]).length) throw new ApiError(400, `Nomor biaya "${manualNumber}" sudah dipakai`);
+  }
+  const number = manualNumber || (await nextExpenseNumber(businessUnit, input.expenseDate));
 
   const conn: PoolConnection = await pool.getConnection();
   try {
@@ -423,11 +441,12 @@ export const expensesController = {
 };
 
 function parseExpenseInput(body: any): CreateExpenseInput {
-  const { contactId, expenseDate, paymentMethod, bankAccountId, payLater, billingAddress, tag, memo, discountAmount, lines } = body;
+  const { number, contactId, expenseDate, paymentMethod, bankAccountId, payLater, billingAddress, tag, memo, discountAmount, lines } = body;
   if (!expenseDate) throw new ApiError(400, "Tanggal transaksi wajib diisi");
   if (!Array.isArray(lines) || !lines.length) throw new ApiError(400, "Minimal 1 baris akun biaya wajib diisi");
 
   return {
+    number: number ? String(number).trim() || null : null,
     contactId: contactId ? Number(contactId) : null,
     expenseDate,
     paymentMethod: paymentMethod || null,
