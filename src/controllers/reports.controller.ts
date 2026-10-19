@@ -9,6 +9,16 @@ import { BusinessUnit } from "../models/types";
 
 const EPOCH = "1970-01-01";
 
+/** The 5 financial-statement reports below (not aged-receivables, GL, etc.) accept a
+ * third "Konsolidasi" option on top of the usual X-Business-Unit b2b/zarve header --
+ * handled entirely in this controller via getAccountBalances' own "consolidated"
+ * support (see reportEngine.ts), so resolveBusinessUnit's global middleware/type stays
+ * untouched and every other endpoint keeps behaving exactly as before. */
+type ReportUnit = BusinessUnit | "consolidated";
+function resolveReportUnit(req: Request): ReportUnit {
+  return req.headers["x-business-unit"] === "consolidated" ? "consolidated" : req.businessUnit;
+}
+
 /** Shared xlsx-buffer responder for every report export below -- one sheet, a title
  * row, then a header row, then data rows (plain arrays, SheetJS infers columns). */
 function sendXlsx(res: Response, sheetName: string, filename: string, title: string, header: string[], rows: (string | number)[][]) {
@@ -34,7 +44,7 @@ function requireDateRange(req: Request): { from: string; to: string } {
 
 /** Shared between balanceSheet and exportBalanceSheet -- see the synthetic
  * "Laba Ditahan (Berjalan)" row comment inline below for why this exists. */
-async function buildBalanceSheet(businessUnit: BusinessUnit, asOf: string) {
+async function buildBalanceSheet(businessUnit: ReportUnit, asOf: string) {
   const rows = await getAccountBalances({ from: EPOCH, to: asOf, businessUnit });
 
   const assets = rows.filter((r) => r.account.type === "asset");
@@ -61,7 +71,10 @@ async function buildBalanceSheet(businessUnit: BusinessUnit, asOf: string) {
       type: "equity" as const,
       parentId: null,
       isActive: true,
-      businessUnit,
+      // Synthetic row, never a real accounts table record -- "consolidated" isn't a
+      // valid Account.businessUnit, so tag it b2b arbitrarily; the FE only shows a
+      // per-row unit badge for real (id !== 0) rows anyway.
+      businessUnit: businessUnit === "consolidated" ? "b2b" : businessUnit,
       description: null,
       categoryId: null,
       taxId: null,
@@ -103,7 +116,7 @@ async function buildBalanceSheet(businessUnit: BusinessUnit, asOf: string) {
  * this report with `to` equal to a balance sheet's `asOf` date, `totalEnding` here must
  * equal that balance sheet's `totalEquity`.
  */
-async function buildEquityChanges(businessUnit: BusinessUnit, from: string, to: string) {
+async function buildEquityChanges(businessUnit: ReportUnit, from: string, to: string) {
   const equityRows = await getAccountBalances({ from, to, types: ["equity"], businessUnit });
   const incomeExpenseRows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit });
 
@@ -123,7 +136,7 @@ async function buildEquityChanges(businessUnit: BusinessUnit, from: string, to: 
       type: "equity" as const,
       parentId: null,
       isActive: true,
-      businessUnit,
+      businessUnit: businessUnit === "consolidated" ? "b2b" : businessUnit,
       description: null,
       categoryId: null,
       taxId: null,
@@ -144,8 +157,39 @@ async function buildEquityChanges(businessUnit: BusinessUnit, from: string, to: 
 }
 
 /** Shared between cashFlow and exportCashFlow -- see cashFlow's own doc comment below
- * for why the cash-account detection differs between business units. */
-async function buildCashFlow(businessUnit: BusinessUnit, from: string, to: string) {
+ * for why the cash-account detection differs between business units.
+ *
+ * Unlike the other 4 reports, "consolidated" can't just drop getAccountBalances'
+ * business_unit filter here -- the cash-account detection itself is a different query
+ * per unit (category lookup for b2b, code prefix for zarve), not just a WHERE clause on
+ * accounts. So consolidated mode runs both units' builds independently and sums the
+ * resulting totals -- each unit's own cash-account detection stays untouched. */
+interface CashFlowResult {
+  from: string;
+  to: string;
+  accounts: AccountBalanceRow[];
+  beginningBalance: number;
+  cashIn: number;
+  cashOut: number;
+  netChange: number;
+  endingBalance: number;
+}
+
+async function buildCashFlow(businessUnit: ReportUnit, from: string, to: string): Promise<CashFlowResult> {
+  if (businessUnit === "consolidated") {
+    const [b2b, zarve] = await Promise.all([buildCashFlow("b2b", from, to), buildCashFlow("zarve", from, to)]);
+    return {
+      from,
+      to,
+      accounts: [...b2b.accounts, ...zarve.accounts],
+      beginningBalance: b2b.beginningBalance + zarve.beginningBalance,
+      cashIn: b2b.cashIn + zarve.cashIn,
+      cashOut: b2b.cashOut + zarve.cashOut,
+      netChange: b2b.netChange + zarve.netChange,
+      endingBalance: b2b.endingBalance + zarve.endingBalance,
+    };
+  }
+
   const rows = await getAccountBalances({ from, to, types: ["asset"], businessUnit });
 
   let cashAccounts;
@@ -177,13 +221,13 @@ async function buildCashFlow(businessUnit: BusinessUnit, from: string, to: strin
 export const reportsController = {
   async trialBalance(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, businessUnit: req.businessUnit });
+    const rows = await getAccountBalances({ from, to, businessUnit: resolveReportUnit(req) });
     res.json({ from, to, rows });
   },
 
   async exportTrialBalance(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, businessUnit: req.businessUnit });
+    const rows = await getAccountBalances({ from, to, businessUnit: resolveReportUnit(req) });
     const active = rows.filter((r) => r.initialBalance !== 0 || r.periodDebit !== 0 || r.periodCredit !== 0 || r.endBalance !== 0);
 
     sendXlsx(
@@ -233,7 +277,7 @@ export const reportsController = {
 
   async profitAndLoss(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit: req.businessUnit });
+    const rows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit: resolveReportUnit(req) });
 
     const income = rows.filter((r) => r.account.type === "income");
     const expense = rows.filter((r) => r.account.type === "expense");
@@ -253,7 +297,7 @@ export const reportsController = {
 
   async exportProfitAndLoss(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const rows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit: req.businessUnit });
+    const rows = await getAccountBalances({ from, to, types: ["income", "expense"], businessUnit: resolveReportUnit(req) });
 
     const income = rows.filter((r) => r.account.type === "income" && (r.periodCredit !== 0 || r.periodDebit !== 0));
     const expense = rows.filter((r) => r.account.type === "expense" && (r.periodDebit !== 0 || r.periodCredit !== 0));
@@ -284,13 +328,13 @@ export const reportsController = {
 
   async balanceSheet(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
-    const result = await buildBalanceSheet(req.businessUnit, asOf);
+    const result = await buildBalanceSheet(resolveReportUnit(req), asOf);
     res.json(result);
   },
 
   async exportBalanceSheet(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
-    const { assets, liabilities, equity, totalAssets, totalLiabilities, totalEquity } = await buildBalanceSheet(req.businessUnit, asOf);
+    const { assets, liabilities, equity, totalAssets, totalLiabilities, totalEquity } = await buildBalanceSheet(resolveReportUnit(req), asOf);
 
     const section = (title: string, rows: AccountBalanceRow[], total: number): (string | number)[][] => [
       [title, ""],
@@ -316,13 +360,13 @@ export const reportsController = {
 
   async equityChanges(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const result = await buildEquityChanges(req.businessUnit, from, to);
+    const result = await buildEquityChanges(resolveReportUnit(req), from, to);
     res.json(result);
   },
 
   async exportEquityChanges(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const { rows, totalBeginning, totalMovement, totalEnding } = await buildEquityChanges(req.businessUnit, from, to);
+    const { rows, totalBeginning, totalMovement, totalEnding } = await buildEquityChanges(resolveReportUnit(req), from, to);
 
     sendXlsx(
       res,
@@ -349,12 +393,12 @@ export const reportsController = {
    */
   async cashFlow(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    res.json(await buildCashFlow(req.businessUnit, from, to));
+    res.json(await buildCashFlow(resolveReportUnit(req), from, to));
   },
 
   async exportCashFlow(req: Request, res: Response) {
     const { from, to } = requireDateRange(req);
-    const { accounts, beginningBalance, cashIn, cashOut, endingBalance } = await buildCashFlow(req.businessUnit, from, to);
+    const { accounts, beginningBalance, cashIn, cashOut, endingBalance } = await buildCashFlow(resolveReportUnit(req), from, to);
 
     sendXlsx(
       res,
@@ -370,15 +414,15 @@ export const reportsController = {
   },
 
   /**
-   * How much each customer owes, bucketed by how long it's been outstanding since the
-   * invoice date (this ledger has no separate due-date field -- a rental invoice's
-   * obligation starts on the invoice date itself). Standard AR-aging report, missing
-   * from this system until now.
-   *
-   * Deliberately NOT business-unit-scoped: this reads `invoices`/`payments` directly,
-   * which are Zarve-only tables (see 014_business_unit.sql) -- same for
-   * vehicleProfitability and geofenceViolations below. Don't "fix" these into reading
-   * req.businessUnit; they're hidden from the nav entirely in B2B mode instead.
+   * How much each customer/driver owes, bucketed by how long it's been outstanding.
+   * Zarve has no separate due-date field (a rental invoice's obligation starts on the
+   * invoice date itself) and reads straight from `invoices`/`payments` -- the Zarve-only
+   * tables from 014_business_unit.sql. B2B's `sale_documents` DOES have a real
+   * `due_date`, so its branch buckets off that instead, which is the more accurate
+   * anchor. Both branches alias their result columns to the same names so they share one
+   * bucketing loop below. vehicleProfitability and geofenceViolations below remain
+   * Zarve-only/unscoped -- don't extend those the same way without equivalent B2B data
+   * to back them.
    */
   async agedReceivables(req: Request, res: Response) {
     const asOf = (req.query.asOf as string) || new Date().toISOString().slice(0, 10);
@@ -386,14 +430,35 @@ export const reportsController = {
     // and computation instead of duplicating the bucket math.
     const partnerId = req.query.partnerId ? Number(req.query.partnerId) : undefined;
 
-    const [rows] = await pool.query(
-      `SELECT i.id, i.number, i.partner_id, p.name AS partner_name, i.invoice_date, i.total_amount,
-         COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id = i.id AND date <= ?), 0) AS paid
-       FROM invoices i
-       JOIN partners p ON p.id = i.partner_id
-       WHERE i.invoice_date <= ? ${partnerId ? "AND i.partner_id = ?" : ""}`,
-      partnerId ? [asOf, asOf, partnerId] : [asOf, asOf]
-    );
+    // B2B's sale_documents has a real due_date (and credit notes via "exchange" docs);
+    // Zarve's invoices table has neither, so its branch falls back to invoice_date as
+    // the aging anchor and a constant 0 for credited. Aliasing both branches to the
+    // same column names (invoice_date, credited) lets them share one bucketing loop
+    // below instead of duplicating it per business unit.
+    const [rows] =
+      req.businessUnit === "b2b"
+        ? await pool.query(
+            `SELECT sd.id, sd.number, sd.contact_id AS partner_id, c.name AS partner_name,
+                    COALESCE(sd.due_date, sd.document_date) AS invoice_date, sd.total_amount,
+                    (SELECT COALESCE(SUM(amount), 0) FROM sale_payments WHERE document_id = sd.id AND payment_date <= ?) AS paid,
+                    (SELECT COALESCE(SUM(sdl.amount), 0) FROM sale_document_lines sdl
+                       JOIN sale_documents ex ON ex.id = sdl.document_id
+                       WHERE sdl.target_document_id = sd.id AND ex.status = 'approved') AS credited
+             FROM sale_documents sd
+             LEFT JOIN contacts c ON c.id = sd.contact_id
+             WHERE sd.business_unit = 'b2b' AND sd.doc_type = 'invoice' AND sd.status = 'approved'
+               AND COALESCE(sd.due_date, sd.document_date) <= ? ${partnerId ? "AND sd.contact_id = ?" : ""}`,
+            partnerId ? [asOf, asOf, partnerId] : [asOf, asOf]
+          )
+        : await pool.query(
+            `SELECT i.id, i.number, i.partner_id, p.name AS partner_name, i.invoice_date, i.total_amount,
+               COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id = i.id AND date <= ?), 0) AS paid,
+               0 AS credited
+             FROM invoices i
+             JOIN partners p ON p.id = i.partner_id
+             WHERE i.invoice_date <= ? ${partnerId ? "AND i.partner_id = ?" : ""}`,
+            partnerId ? [asOf, asOf, partnerId] : [asOf, asOf]
+          );
 
     const asOfMs = new Date(asOf).getTime();
     type Bucket = "current" | "d1to30" | "d31to60" | "d61to90" | "d90plus";
@@ -414,7 +479,7 @@ export const reportsController = {
     >();
 
     for (const r of rows as any[]) {
-      const outstanding = Number(r.total_amount) - Number(r.paid);
+      const outstanding = Number(r.total_amount) - Number(r.paid) - Number(r.credited ?? 0);
       if (outstanding <= 0.01) continue;
 
       let entry = byPartner.get(r.partner_id);
@@ -432,7 +497,7 @@ export const reportsController = {
         invoiceNumber: r.number,
         invoiceDate: r.invoice_date,
         totalAmount: Number(r.total_amount),
-        paid: Number(r.paid),
+        paid: Number(r.paid) + Number(r.credited ?? 0),
         outstanding,
         bucket,
       });

@@ -23,22 +23,33 @@ function signedBalance(type: AccountType, raw: number): number {
  * endBalance = balance as of `to`. Debit-normal types (asset, expense) report the raw
  * debit-minus-credit balance; credit-normal types (liability, equity, income) report
  * the balance sign-flipped so a normal positive balance reads as positive here too.
+ *
+ * `businessUnit: "consolidated"` simply drops the business_unit filter -- accounts are
+ * completely separate rows per unit (unique key (business_unit, code), see
+ * 014_business_unit.sql), so there's no same-named-account merging to do; every row
+ * already carries its own real `account.businessUnit`, and callers that sum the
+ * returned rows into report totals automatically get a combined B2B+Zarve total for
+ * free, with no extra logic needed here.
  */
 export async function getAccountBalances(params: {
   from: string;
   to: string;
   types?: AccountType[];
-  businessUnit: BusinessUnit;
+  businessUnit: BusinessUnit | "consolidated";
 }): Promise<AccountBalanceRow[]> {
   const { from, to, types, businessUnit } = params;
-  const clauses: string[] = ["a.business_unit = ?"];
-  const args: unknown[] = [businessUnit];
+  const clauses: string[] = [];
+  const args: unknown[] = [];
+  if (businessUnit !== "consolidated") {
+    clauses.push("a.business_unit = ?");
+    args.push(businessUnit);
+  }
 
   if (types && types.length) {
     clauses.push(`a.type IN (${types.map(() => "?").join(",")})`);
     args.push(...types);
   }
-  const where = `WHERE ${clauses.join(" AND ")}`;
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
 
   const sql = `
     SELECT
