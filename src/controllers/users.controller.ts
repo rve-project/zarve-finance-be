@@ -15,6 +15,7 @@ function mapRow(row: any): ManagedUser {
     role: row.role,
     aktif: Boolean(row.aktif),
     canViewActivityLog: Boolean(row.can_view_activity_log),
+    canApproveCorrections: Boolean(row.can_approve_corrections),
     zarveUserId: row.zarve_user_id,
     allowedModules: row.allowed_modules ?? null,
     hasLocalPassword: Boolean(row.password_hash),
@@ -81,7 +82,7 @@ export const usersController = {
     const current = await findRow(req.params.id);
     if (!current) throw new ApiError(404, "User tidak ditemukan");
 
-    const { name, aktif, canViewActivityLog, password } = req.body;
+    const { name, aktif, canViewActivityLog, canApproveCorrections, password } = req.body;
     if (aktif === false && current.aktif) {
       if (current.id === req.authUser!.id) throw new ApiError(400, "Tidak bisa menonaktifkan akun sendiri");
       if ((await countOtherActiveUsers(current.id)) === 0) throw new ApiError(400, "Minimal harus ada satu user aktif");
@@ -91,13 +92,14 @@ export const usersController = {
     const passwordHash = typeof password === "string" && password ? hashPassword(password) : undefined;
 
     await pool.query(
-      `UPDATE users SET name = ?, aktif = ?, can_view_activity_log = ?, allowed_modules = ?
+      `UPDATE users SET name = ?, aktif = ?, can_view_activity_log = ?, can_approve_corrections = ?, allowed_modules = ?
        ${passwordHash !== undefined ? ", password_hash = ?" : ""}
        WHERE id = ?`,
       [
         typeof name === "string" && name.trim() ? name.trim() : current.name,
         typeof aktif === "boolean" ? aktif : Boolean(current.aktif),
         typeof canViewActivityLog === "boolean" ? canViewActivityLog : Boolean(current.can_view_activity_log),
+        typeof canApproveCorrections === "boolean" ? canApproveCorrections : Boolean(current.can_approve_corrections),
         allowedModules === undefined
           ? current.allowed_modules
             ? JSON.stringify(current.allowed_modules)

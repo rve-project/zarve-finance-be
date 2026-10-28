@@ -1,9 +1,11 @@
 import { Request, Response } from "express";
+import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { postJournalEntry } from "../utils/ledger";
 import { computeDepreciation, periodDepreciation, SUPPORTED_DEPRECIATION_METHODS } from "../utils/depreciation";
 import { runDueDepreciation } from "../utils/depreciationPosting";
+import { assertPeriodOpen } from "../utils/periodLock";
 
 /**
  * Fixed asset register (B2B): buying an asset posts a real journal entry (debit the
@@ -454,38 +456,62 @@ export const fixedAssetsController = {
             { accountId: asset.categoryAccountId, debit: 0, credit: -adjustment },
           ];
 
-    const journalEntryId = await postJournalEntry({
-      date: revaluationDate,
-      ref: `REVAL-${asset.assetNumber}`,
-      narration: `Revaluasi aset tetap: ${asset.name}`,
-      sourceType: "manual",
-      businessUnit: req.businessUnit,
-      lines,
-    });
+    const conn: PoolConnection = await pool.getConnection();
+    let journalEntryId: number;
+    try {
+      await conn.beginTransaction();
 
-    await pool.query(
-      "UPDATE fixed_assets SET acquisition_cost = ?, acquisition_date = ?, opening_accumulated_depreciation = 0 WHERE id = ?",
-      [newValueNum, revaluationDate, asset.id]
-    );
+      await assertPeriodOpen({
+        conn,
+        businessUnit: req.businessUnit,
+        resourceType: "fixed_asset_revaluation",
+        resourceId: asset.id,
+        date: revaluationDate,
+      });
 
-    await pool.query(
-      `INSERT INTO fixed_asset_revaluations (
-         fixed_asset_id, revaluation_date, previous_acquisition_cost, previous_book_value, new_value,
-         adjustment_amount, adjustment_account_id, journal_entry_id, notes, created_by
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        asset.id,
-        revaluationDate,
-        asset.acquisitionCost,
-        dep.bookValue,
-        newValueNum,
-        adjustment,
-        Number(adjustmentAccountId),
-        journalEntryId,
-        notes || null,
-        req.authUser!.id,
-      ]
-    );
+      journalEntryId = await postJournalEntry(
+        {
+          date: revaluationDate,
+          ref: `REVAL-${asset.assetNumber}`,
+          narration: `Revaluasi aset tetap: ${asset.name}`,
+          sourceType: "manual",
+          businessUnit: req.businessUnit,
+          lines,
+        },
+        conn
+      );
+
+      await conn.query(
+        "UPDATE fixed_assets SET acquisition_cost = ?, acquisition_date = ?, opening_accumulated_depreciation = 0 WHERE id = ?",
+        [newValueNum, revaluationDate, asset.id]
+      );
+
+      await conn.query(
+        `INSERT INTO fixed_asset_revaluations (
+           fixed_asset_id, revaluation_date, previous_acquisition_cost, previous_book_value, new_value,
+           adjustment_amount, adjustment_account_id, journal_entry_id, notes, created_by
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          asset.id,
+          revaluationDate,
+          asset.acquisitionCost,
+          dep.bookValue,
+          newValueNum,
+          adjustment,
+          Number(adjustmentAccountId),
+          journalEntryId,
+          notes || null,
+          req.authUser!.id,
+        ]
+      );
+
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
 
     res.status(201).json({ journalEntryId, previousBookValue: dep.bookValue, newValue: newValueNum, adjustment });
   },

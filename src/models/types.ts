@@ -212,6 +212,8 @@ export interface User {
   role: UserRole;
   aktif: boolean;
   canViewActivityLog: boolean;
+  /** "Pihak berwenang" who can approve/reject a Permintaan Koreksi (see koreksi_requests). */
+  canApproveCorrections: boolean;
   /** Per-user menu restriction. Null/undefined = full access (default). */
   allowedModules: string[] | null;
 }

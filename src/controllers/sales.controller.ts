@@ -4,6 +4,7 @@ import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { postJournalEntry, getAccountIdByCode, resolveTaxJournalLines } from "../utils/ledger";
 import { adjustWarehouseStock } from "../utils/warehouseStock";
+import { assertPeriodOpen } from "../utils/periodLock";
 
 /**
  * "Penjualan" (Sales) -- mirrors purchases.controller.ts's pipeline but for the
@@ -488,6 +489,20 @@ export const salesController = {
     const conn: PoolConnection = await pool.getConnection();
     try {
       await conn.beginTransaction();
+
+      // Approving a quotation/order touches nothing in the ledger -- only "invoice" and
+      // "exchange" post a journal below, so those are the only doc types Tutup Buku needs
+      // to gate (approving a stale quotation has zero ledger impact either way).
+      if (doc.doc_type === "invoice" || doc.doc_type === "exchange") {
+        await assertPeriodOpen({
+          conn,
+          businessUnit: req.businessUnit,
+          resourceType: "sale_invoice_approval",
+          resourceId: doc.id,
+          date: doc.document_date,
+        });
+      }
+
       await conn.query("UPDATE sale_documents SET status = 'approved', approved_by = ?, approved_at = NOW() WHERE id = ?", [
         req.authUser!.id,
         id,

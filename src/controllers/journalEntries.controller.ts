@@ -1,7 +1,9 @@
 import { Request, Response } from "express";
+import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { postJournalEntry, JournalLineInput } from "../utils/ledger";
+import { assertPeriodOpen } from "../utils/periodLock";
 
 /**
  * Manual journal entries -- for adjustments, corrections, accruals, depreciation, and
@@ -122,14 +124,31 @@ export const journalEntriesController = {
     }
 
     // postJournalEntry itself throws if debit != credit -- no need to duplicate that check.
-    const id = await postJournalEntry({
-      date,
-      ref: ref ?? null,
-      narration: narration ?? null,
-      sourceType: "manual",
-      businessUnit: req.businessUnit,
-      lines: journalLines,
-    });
+    const conn: PoolConnection = await pool.getConnection();
+    let id: number;
+    try {
+      await conn.beginTransaction();
+      // resourceId is null -- the entry doesn't exist yet, so there's nothing to
+      // reference until this write itself creates it (see utils/periodLock.ts).
+      await assertPeriodOpen({ conn, businessUnit: req.businessUnit, resourceType: "journal_entry", resourceId: null, date });
+      id = await postJournalEntry(
+        {
+          date,
+          ref: ref ?? null,
+          narration: narration ?? null,
+          sourceType: "manual",
+          businessUnit: req.businessUnit,
+          lines: journalLines,
+        },
+        conn
+      );
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
     res.status(201).json({ id });
   },
 

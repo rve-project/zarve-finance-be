@@ -37,6 +37,7 @@ import { expensesRouter } from "./expenses.routes";
 import { purchasesRouter } from "./purchases.routes";
 import { salesRouter } from "./sales.routes";
 import { activityLogsRouter } from "./activityLogs.routes";
+import { koreksiRequestsRouter } from "./koreksiRequests.routes";
 
 export const apiRouter = Router();
 
@@ -79,3 +80,4 @@ apiRouter.use("/expenses", expensesRouter);
 apiRouter.use("/purchases", purchasesRouter);
 apiRouter.use("/sales", salesRouter);
 apiRouter.use("/activity-logs", activityLogsRouter);
+apiRouter.use("/koreksi-requests", koreksiRequestsRouter);

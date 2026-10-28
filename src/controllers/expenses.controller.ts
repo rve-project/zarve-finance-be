@@ -3,6 +3,7 @@ import { PoolConnection } from "mysql2/promise";
 import { pool } from "../db";
 import { ApiError } from "../middlewares/errorHandler";
 import { postJournalEntry, getAccountIdByCode, resolveTaxJournalLines } from "../utils/ledger";
+import { assertPeriodOpen } from "../utils/periodLock";
 
 /**
  * "Pengeluaran" (Mekari Jurnal's "Buat Biaya") -- a one-step expense: paid immediately
@@ -257,9 +258,19 @@ export async function updateExpense(businessUnit: "zarve" | "b2b", id: number, i
     );
     const oldJournalId = (oldJournalRows as any[])[0]?.id;
     if (oldJournalId) {
+      // Reconciliation is an unconditional hard block with no override -- check it
+      // before period-lock, which has an escape hatch (Permintaan Koreksi), so a user
+      // isn't sent to request a correction that approval could never actually unblock.
       await assertJournalNotReconciled(conn, oldJournalId);
+      await assertPeriodOpen({ conn, businessUnit, resourceType: "expense", resourceId: id, date: existing.expense_date });
       await conn.query("DELETE FROM journal_lines WHERE journal_entry_id = ?", [oldJournalId]);
       await conn.query("DELETE FROM journal_entries WHERE id = ?", [oldJournalId]);
+    }
+    // If the date is also being changed to another closed period, that's a second,
+    // independent write into a closed period (posting the new journal below) -- needs
+    // its own approved koreksi_request, not covered by whatever unlocked the old date.
+    if (input.expenseDate !== existing.expense_date) {
+      await assertPeriodOpen({ conn, businessUnit, resourceType: "expense", resourceId: id, date: input.expenseDate });
     }
     await conn.query("DELETE FROM expense_lines WHERE expense_id = ?", [id]);
 
@@ -328,6 +339,7 @@ export async function deleteExpense(businessUnit: "zarve" | "b2b", id: number) {
     const journalId = (journalRows as any[])[0]?.id;
     if (journalId) {
       await assertJournalNotReconciled(conn, journalId);
+      await assertPeriodOpen({ conn, businessUnit, resourceType: "expense", resourceId: id, date: existing.expense_date });
       await conn.query("DELETE FROM journal_lines WHERE journal_entry_id = ?", [journalId]);
       await conn.query("DELETE FROM journal_entries WHERE id = ?", [journalId]);
     }

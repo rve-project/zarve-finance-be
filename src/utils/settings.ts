@@ -14,6 +14,9 @@ export interface AppSettings {
    * (VAT-registered); this stays off until that's confirmed and turned on here. */
   ppnEnabled: boolean;
   ppnRate: number;
+  /** Tutup Buku: a transaction older than this many days can no longer write to the
+   * ledger directly -- see utils/periodLock.ts. */
+  periodLockDays: number;
 }
 
 export interface UpdateSettingsInput {
@@ -22,6 +25,7 @@ export interface UpdateSettingsInput {
   autoCreatePayment?: boolean;
   ppnEnabled?: boolean;
   ppnRate?: number;
+  periodLockDays?: number;
 }
 
 function mapRow(row: any): AppSettings {
@@ -31,6 +35,7 @@ function mapRow(row: any): AppSettings {
     autoCreatePayment: !!row.auto_create_payment,
     ppnEnabled: !!row.ppn_enabled,
     ppnRate: Number(row.ppn_rate),
+    periodLockDays: Number(row.period_lock_days),
   };
 }
 
@@ -68,6 +73,10 @@ export async function updateSettings(patch: UpdateSettingsInput): Promise<AppSet
   if (patch.ppnRate !== undefined) {
     sets.push("ppn_rate = ?");
     params.push(patch.ppnRate);
+  }
+  if (patch.periodLockDays !== undefined) {
+    sets.push("period_lock_days = ?");
+    params.push(patch.periodLockDays);
   }
 
   if (sets.length) {
